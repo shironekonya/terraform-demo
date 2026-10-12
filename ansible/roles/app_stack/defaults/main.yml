@@ -1,0 +1,15 @@
+---
+# ---------------------------------------------------------------------------
+# 容器栈的位置与身份
+# ---------------------------------------------------------------------------
+wf_stack_root: /opt/wf/stacks
+wf_stack_name: wf-web
+wf_stack_dir: "{{ wf_stack_root }}/{{ wf_stack_name }}"
+
+# 对外端口。默认 8080 —— 刻意避开 80：
+# 阿里云 ECS 的 user_data 已经在 80 上起了系统 nginx（见 aliyun-ecs/ecs.tf），
+# 两个声明式工具抢同一个端口正是这个项目一路在避免的事。
+# 在 group_vars/cloud.yml 里也可以覆盖。
+wf_stack_port: 8080
+
+wf_stack_image: nginx:alpine

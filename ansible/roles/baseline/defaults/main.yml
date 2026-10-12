@@ -1,0 +1,68 @@
+---
+# ===========================================================================
+# baseline 的默认值 —— 这些是"基线"的定义本身
+#
+# 想改基线内容，改这里，不要改 tasks/。
+# （roles/baseline/tasks/report.yml 会把这些值原样报给用户，
+#   保证"说的"和"做的"用的是同一份定义。）
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 基础包
+#
+# 目前 RHEL 族与 Debian 族的包名恰好一致，所以只用一份清单。
+# 如果某天出现分歧（比如某个包在两边叫法不同），
+# 就在这里拆成 _rhel / _debian 两份，并在 group_vars 里按组覆盖。
+# ---------------------------------------------------------------------------
+wf_base_packages:
+  - curl
+  - git
+  - jq
+  - unzip
+  - tar
+  - chrony
+  - python3
+
+# 要创建的目录。**只创建缺失的** —— 已存在的一律不碰。
+wf_base_dirs:
+  - /opt/wf
+  - /opt/wf/stacks
+
+# ---------------------------------------------------------------------------
+# 受本 role 管理的配置文件
+#
+# ★ 注意 wf_managed_conf_files 是下面这些路径的"汇总视图"，
+#   只在这一处定义，避免同一个事实写两遍（这类重复是本项目反复踩过的坑）。
+# ---------------------------------------------------------------------------
+wf_sysctl_file: /etc/sysctl.d/99-wf.conf
+wf_limits_file: /etc/security/limits.d/99-wf.conf
+wf_timezone_file: /etc/localtime
+
+wf_managed_conf_files: "{{ [wf_sysctl_file, wf_limits_file, wf_timezone_file] }}"
+
+# ---------------------------------------------------------------------------
+# 内核参数（K3s / 容器比较需要的几项）
+# ---------------------------------------------------------------------------
+wf_sysctl_settings:
+  fs.inotify.max_user_instances: 1024
+  fs.inotify.max_user_watches: 524288
+  net.bridge.bridge-nf-call-iptables: 1
+  net.core.somaxconn: 32768
+  net.ipv4.ip_forward: 1
+  vm.swappiness: 10
+
+# ---------------------------------------------------------------------------
+# 文件描述符上限
+# ---------------------------------------------------------------------------
+wf_limits_settings:
+  - domain: "*"
+    limit_type: soft
+    item: nofile
+    value: 65536
+  - domain: "*"
+    limit_type: hard
+    item: nofile
+    value: 65536
+
+# 时间同步服务名：RHEL 族叫 chronyd，Debian 族叫 chrony
+wf_chrony_service: "{{ 'chronyd' if ansible_os_family == 'RedHat' else 'chrony' }}"

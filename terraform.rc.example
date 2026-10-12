@@ -1,0 +1,27 @@
+# Terraform CLI 配置文件（可选）
+#
+# 用途：国内网络直连 registry.terraform.io 与 GitHub Releases 经常超时，
+#       导致 terraform init 卡在下载 provider 上。这里改用国内镜像源加速。
+#
+# 启用方式（二选一）：
+#   1) 把这个文件放到项目目录，命名为 terraform.rc，并设置环境变量：
+#        Windows PowerShell:  $env:TF_CLI_CONFIG_FILE = "路径\terraform.rc"
+#   2) 也可以写成 .terraformrc 放到用户目录：
+#        Windows: C:\Users\<你>\AppData\Roaming\terraform.rc
+#        Linux/macOS: ~/.terraformrc
+#
+# 注意：镜像只影响 provider 下载，不影响任何业务逻辑与安全性。
+
+provider_installation {
+  # 阿里云镜像（Terraform 官方推荐写法，用 network_mirror 协议）
+  network_mirror {
+    url = "https://mirrors.aliyun.com/terraform/"
+    # 只把 aliyun 这个 provider 走镜像，其余仍走官方源
+    include = ["registry.terraform.io/aliyun/*"]
+  }
+
+  # 官方源作为兜底：镜像里没有的 provider 仍从官方拉取
+  direct {
+    exclude = ["registry.terraform.io/aliyun/*"]
+  }
+}

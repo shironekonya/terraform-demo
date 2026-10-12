@@ -1,0 +1,9 @@
+# ---------------------------------------------------------------------------
+# 由 Ansible 管理（roles/baseline），手工修改会在下次运行 playbook 时被覆盖。
+#
+# 想改这些值，请改 roles/baseline/defaults/main.yml 的 wf_sysctl_settings，
+# 而不是直接改这个文件 —— 否则下次运行就被改回来了。
+# ---------------------------------------------------------------------------
+{% for key, value in wf_sysctl_settings | dictsort %}
+{{ key }} = {{ value }}
+{% endfor %}

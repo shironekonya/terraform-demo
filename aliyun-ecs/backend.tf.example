@@ -1,0 +1,63 @@
+# ===========================================================================
+# 远程后端模板（阿里云 OSS + TableStore 状态锁）
+#
+# ★★ 这个文件默认**不生效**：Terraform 只加载 *.tf / *.tf.json，
+#    所以 `.tf.example` 后缀不会被解析，仓库开箱即可用本地 state。
+#
+#    多人协作 / CI 场景下必须启用它 —— 本地 state 有两个致命问题：
+#      1. 两个人同时 apply，双方各自读到旧 state，后写的把先写的覆盖掉
+#         （已创建但"消失在 state 里"的资源 = 永远无法 destroy 的幽灵资源）
+#      2. state 里是明文凭证（ECS user_data、密钥、密码），散落在各人机器上
+#
+# 启用步骤：
+#   1) 创建 OSS Bucket（建议专用，不要和业务共用一个桶）
+#   2) 创建 OTS(TableStore) 实例 + 一张锁表
+#        ★ 锁表必须有名为 `LockID` 的主键，类型 String —— 漏了会报锁失败
+#   3) 本地改这份文件为 backend.tf，填掉下面的 <占位符>
+#   4) terraform init -migrate-state    # 把现有本地 state 搬上去
+#
+# 凭证**不要写在这里**：写进来会被存进 .terraform/ 和 plan 文件里。
+# 用环境变量，优先级见文件末尾。
+# ===========================================================================
+
+terraform {
+  backend "oss" {
+    # --- 状态文件放哪 ---------------------------------------------------
+    bucket = "<你的-state-bucket>"         # 必须已存在，本模块不负责创建
+    prefix = "terraform-demo/aliyun-ecs" # 状态文件的目录前缀
+    key    = "terraform.tfstate"
+    # prefix 默认值是 "env:"，那是"按 workspace 分目录"的特殊写法。
+    # 写成上面这种字面路径时，状态落在 <prefix>/<key>。
+    region = "cn-hangzhou" # 必须是 bucket 所在的 region
+    acl    = "private"     # 状态文件是私有对象，别开公共读
+
+    # --- 状态锁（★ 这一段才是"防并发"的关键） ---------------------------
+    # 不配这一段，OSS 后端就是"能存不能锁"：两个人同时 apply 依然会互相覆盖。
+    # 表要提前建好，Terraform 不会替你建。
+    tablestore_endpoint = "https://<你的-ots-实例>.cn-hangzhou.ots.aliyuncs.com"
+    tablestore_table    = "<你的-锁表名>"
+    # 若上面的 endpoint 是**VPC 内网地址**，Terraform 从地址里解析不出实例名，
+    # 需要额外显式给一个（官方文档明确提到这点）：
+    # tablestore_instance_name = "<你的-ots-实例>"
+
+    # --- 服务端加密 -----------------------------------------------------
+    # 状态里有明文凭证，开着成本几乎为零
+    encrypt = true
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 凭证从哪来（优先级从高到低）
+#
+#   1) 环境变量（推荐，也是 CI 里唯一合适的做法）：
+#        export ALICLOUD_ACCESS_KEY="..."
+#        export ALICLOUD_SECRET_KEY="..."
+#        export ALICLOUD_REGION="cn-hangzhou"
+#   2) ~/.aliyun/config.json（aliyun configure 生成）
+#   3) 假定 RAM 角色（ECS 实例内 / CI 里用 OIDC 换临时凭证）：
+#        export ALICLOUD_ASSUME_ROLE_ARN="acs:ram::1234567890:role/tf-role"
+#
+# ★ 顺带一提：这个后端只管 aliyun-ecs 这一份 state。
+#   vmware-workstation 用自己的 key 指向同一个桶（见那个目录的 backend.tf.example），
+#   两份 state 共享一把锁表，互不干扰。
+# ---------------------------------------------------------------------------

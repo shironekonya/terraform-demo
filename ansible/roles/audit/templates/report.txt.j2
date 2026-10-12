@@ -1,0 +1,115 @@
+{#-
+  只读体检报告模板
+
+  由 roles/audit 在**控制端**渲染（lookup('template') + delegate_to: localhost），
+  所以这里出现的所有变量都来自"被体检的那台主机"。
+
+  设计约束：这个模板只负责"把已经采集到的数据排版成人能读的东西"。
+  所有采集动作都在 tasks/main.yml 里，且都是只读的。
+-#}
+{% set _addr = ansible_host | default('未指定地址') -%}
+{% set _is_local = wf_in_local_group | default(false) | bool -%}
+{% set _protected = wf_protected | default(true) | bool -%}
+{% set _tool_lines = wf_audit_tools.stdout_lines | default([]) -%}
+{% set _listen = wf_audit_listen.stdout_lines | default([]) -%}
+{% set _svc_lines = wf_audit_services_raw.stdout_lines | default([]) -%}
+{% set _docker_out = wf_audit_containers.stdout | default('') -%}
+{% set _k3s_lines = wf_audit_k3s.stdout_lines | default([]) -%}
+{% set _sep = '════════════════════════════════════════════════════════════════════════' -%}
+{% set _thin = '────────────────────────────────────────────────────────────────────────' -%}
+{{ _sep }}
+ {{ inventory_hostname }}  ·  只读体检报告
+ 地址 {{ _addr }}          生成于 {{ now(fmt='%Y-%m-%d %H:%M:%S') }}
+ 本次运行只有只读任务，被管机器改动数应为 0
+{{ _sep }}
+
+ 保护状态
+{{ _thin }}
+   归组          : {{ 'local  ← 本地服务器' if _is_local else 'cloud  ← 云服务器' }}
+   只读保护      : {{ '是 · Ansible 不会修改这台机器' if _protected else '否 · 允许变更（已显式解锁）' }}
+   这台机器在跑  : {{ wf_note | default('（未在清单里标注）') }}
+
+ 系统
+{{ _thin }}
+   主机名        : {{ ansible_hostname | default('-') }}
+   发行版        : {{ ansible_distribution | default('-') }} {{ ansible_distribution_version | default('') }}
+   内核          : {{ ansible_kernel | default('-') }}
+   架构          : {{ ansible_architecture | default('-') }}
+   vCPU          : {{ ansible_processor_vcpus | default('-') }}
+   内存          : {{ ((ansible_memtotal_mb | default(0)) / 1024) | round(1) }} GB
+   已运行        : {{ ((ansible_uptime_seconds | default(0)) / 86400) | round(1) }} 天
+
+ 磁盘
+{{ _thin }}
+{% for m in ansible_mounts | default([]) %}
+{%   if (m.size_total | default(0)) > 0 %}
+{%     set _pct = (100 * (m.size_total - m.size_available) / m.size_total) | round(1) %}
+{%     set _flag = '⚠ 快满了' if _pct >= 85 else '' %}
+   {{ '%-22s' | format(m.mount) }} 已用 {{ '%5.1f' | format(_pct) }}%   可用 {{ '%7.1f' | format(m.size_available / 1073741824) }} G / 共 {{ '%7.1f' | format(m.size_total / 1073741824) }} G  {{ _flag }}
+{%   endif %}
+{% endfor %}
+
+ 工具与运行时
+{{ _thin }}
+{% for line in _tool_lines %}
+{%   set parts = line.split('|', 1) %}
+{%   set _name = parts[0] %}
+{%   set _ver = parts[1] | default('') %}
+   {{ '%-10s' | format(_name) }} {{ '⛔ 未安装' if _ver == 'MISSING' else _ver }}
+{% endfor %}
+
+ 关注端口
+{{ _thin }}
+{% for p in wf_audit_ports | default([]) %}
+{%   set _on = (p.port | string) in _listen %}
+   {{ '%-6s' | format(p.port) }} {{ '✅ 在听' if _on else '—  ' }}   {{ p.what }}
+{% endfor %}
+{% if '__NO_SS__' in _listen %}
+   ⚠ 这台机器上既没有 ss 也没有 netstat，端口无法探测
+{% endif %}
+
+ systemd 服务
+{{ _thin }}
+{% if '__NO_SYSTEMD__' in _svc_lines %}
+   （这台机器没有 systemd，跳过）
+{% elif _svc_lines | length == 0 %}
+   （清单里关注的服务一个都没找到）
+{% else %}
+{%   for line in _svc_lines %}
+{%     set parts = line.split('|') %}
+{%     set _state = parts[1] | default('?') %}
+{%     set _enabled = parts[2] | default('?') %}
+   {{ '%-18s' | format(parts[0]) }} {{ '✅' if _state == 'active' else '⛔' }} {{ '%-10s' | format(_state) }} {{ _enabled }}
+{%   endfor %}
+{% endif %}
+
+ 容器
+{{ _thin }}
+{% if '__NO_DOCKER__' in _docker_out %}
+   （这台机器上没有 docker）
+{% elif '__NO_DOCKER_PERM__' in _docker_out %}
+   ⛔ 有 docker 但读不到（守护进程没跑，或当前用户不在 docker 组）
+      → 盘点这类信息需要 become（本地服务器用的是 ubuntu + 免密 sudo）
+{% else %}
+{%   for line in wf_audit_containers.stdout_lines | default([]) %}
+   {{ line }}
+{%   endfor %}
+{% endif %}
+
+ K3s
+{{ _thin }}
+{% if '__NO_K3S__' in _k3s_lines %}
+   （这台机器上没有 k3s）
+{% else %}
+{%   for line in _k3s_lines %}
+{%     if line == '---' %}
+{{ _thin }}
+{%     else %}
+   {{ line }}
+{%     endif %}
+{%   endfor %}
+{% endif %}
+
+{{ _sep }}
+ 报告结束 · 本次未修改 {{ inventory_hostname }} 上的任何东西
+{{ _sep }}

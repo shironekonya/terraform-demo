@@ -1,0 +1,19 @@
+---
+# 只读：把 detect.yml 的结果说成人话。不改变任何东西。
+- name: "baseline · 差异清单"
+  ansible.builtin.debug:
+    msg: "{{ [
+      '─────────────────────────────────────────────────────────────',
+      ' baseline 差异 · ' ~ inventory_hostname,
+      '─────────────────────────────────────────────────────────────',
+      ' 缺失的基础包     : ' ~ (wf_missing_packages | length | string) ~ ' 个  '
+        ~ (wf_missing_packages | join(', ') if (wf_missing_packages | length) else '(无)'),
+      ' 缺失的目录       : ' ~ (wf_missing_dirs | length | string) ~ ' 个  '
+        ~ (wf_missing_dirs | join(', ') if (wf_missing_dirs | length) else '(无)'),
+      ' 已存在的受管文件 : '
+        ~ (wf_existing_conf | join(', ') if (wf_existing_conf | length) else '(无)'),
+      '',
+      ' 本机受保护       : ' ~ ('是 → 本次不会改动任何东西' if (wf_protected | bool) else '否 → 会应用上面的差异'),
+      ' 可覆盖已有文件   : ' ~ ('可以' if (wf_can_write | bool) else '不可以（只补缺）'),
+      '─────────────────────────────────────────────────────────────'
+    ] }}"

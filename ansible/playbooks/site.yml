@@ -1,0 +1,111 @@
+---
+# ===========================================================================
+# site.yml —— 唯一入口
+#
+# 五幕按「风险从低到高」排列：
+#
+#   A  全主机只读体检          任何机器都安全
+#   B  本地服务器基线检测      只读（baseline 在受保护机器上自动只跑检测）
+#   C  云服务器基线 + Docker   只碰 cloud
+#   D  云服务器容器栈          只碰 cloud
+#   E  本地服务器变更          默认整幕不执行，要显式解锁
+#
+# 每个 play 都必须满足两条（tools/check_guard.py 会静态校验）：
+#   1. 声明 intent（read / mutate）—— guard 靠它判断该不该拦
+#   2. roles 的第一个必须是 guard —— 保护必须先于任何动作
+#
+# ★ 默认跑法（安全）：
+#     ansible-playbook playbooks/site.yml
+#   只读，对本地服务器一个字节都不改。
+#
+# ★ 看变更会做什么（干跑）：
+#     ansible-playbook playbooks/site.yml -e local_mutation_allowed=true --check --diff
+#
+# ★ 真的改本地服务器（只补缺，不覆盖）：
+#     ansible-playbook playbooks/site.yml -e local_mutation_allowed=true
+# ===========================================================================
+
+# ───────────────────────────────────────────────────────────────────────────
+# A · 全主机只读体检
+#     为什么放第一幕：它同时是"文档"和"安全网" ——
+#     先让所有人看到现实是什么样，再谈要不要改。
+# ───────────────────────────────────────────────────────────────────────────
+- name: "A · 体检：所有服务器（只读）"
+  hosts: all
+  gather_facts: true
+  vars:
+    intent: read
+  roles:
+    - guard
+    - audit
+
+# ───────────────────────────────────────────────────────────────────────────
+# B · 本地服务器的基线检测
+#     baseline 在受保护的机器上只会跑 detect + report，apply 自动跳过。
+#     结果是"能看清差什么，但什么都没改" —— 正是对待存量环境该有的姿势。
+# ───────────────────────────────────────────────────────────────────────────
+- name: "B · 基线检测：本地服务器（只读）"
+  hosts: local
+  gather_facts: true
+  vars:
+    intent: read
+  roles:
+    - guard
+    - baseline
+
+# ───────────────────────────────────────────────────────────────────────────
+# C · 云服务器基线 + 容器运行时
+# ───────────────────────────────────────────────────────────────────────────
+- name: "C · 基线：云服务器（可变更）"
+  hosts: cloud
+  gather_facts: true
+  vars:
+    intent: mutate
+  roles:
+    - guard
+    - baseline
+    - docker_engine
+
+# ───────────────────────────────────────────────────────────────────────────
+# D · 云服务器容器栈
+# ───────────────────────────────────────────────────────────────────────────
+- name: "D · 服务：云服务器（拉起容器栈）"
+  hosts: cloud
+  gather_facts: true
+  vars:
+    intent: mutate
+  roles:
+    - guard
+    - app_stack
+
+# ───────────────────────────────────────────────────────────────────────────
+# E · 本地服务器变更 —— 默认整幕不执行
+#
+#     为什么用 pre_tasks + meta: end_play 而不是写 when：
+#       这一整幕的 intent 就是 mutate，而 mutate 的 intent 必须能被 guard 看到
+#       并断言。如果改成"条件时才把 intent 设成 mutate"，那 guard 的判断条件
+#       会变得又绕又隐蔽 —— 保护的逻辑必须一眼能看懂。
+#
+#     所以这里的选择是：幕照常声明 mutate（于是 guard 一定会检查），
+#     但用一个显式的前置判断决定"这一幕到底要不要跑"。
+#     两层各管一件事，读起来也清楚。
+# ───────────────────────────────────────────────────────────────────────────
+- name: "E · 本地服务器：仅在显式解锁时执行（默认跳过）"
+  hosts: local
+  gather_facts: true
+  vars:
+    intent: mutate
+  pre_tasks:
+    - name: "E · 未显式解锁 → 结束本幕（默认路径）"
+      ansible.builtin.meta: end_play
+      when: not (local_mutation_allowed | default(false) | bool)
+
+    - name: "E · 已解锁 → 先说明会发生什么"
+      ansible.builtin.debug:
+        msg:
+          - "⚠ 本地服务器已解锁变更（local_mutation_allowed=true）。"
+          - "  覆盖已有文件：{{ '允许（local_overwrite_allowed=true）' if (local_overwrite_allowed | default(false) | bool) else '禁止 —— 本次只会新增缺失的对象' }}"
+          - "  建议：先跑一次 --check --diff 看清楚要改什么。"
+  roles:
+    - guard
+    - baseline

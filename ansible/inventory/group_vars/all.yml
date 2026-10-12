@@ -1,0 +1,44 @@
+---
+# ===========================================================================
+# 全局变量（cloud / local 都生效）
+# ===========================================================================
+
+# 只读体检报告输出到控制端的哪里（不是写到被管机器上）
+wf_report_dir: "{{ playbook_dir }}/../reports"
+
+# 时区（baseline 会把它设成这个值）
+wf_timezone: Asia/Shanghai
+
+# ---------------------------------------------------------------------------
+# 只读体检要关注的对象
+# ---------------------------------------------------------------------------
+
+# systemd 服务：不存在的会被自动跳过，不会报错
+wf_audit_services:
+  - sshd
+  - docker
+  - containerd
+  - k3s
+  - k3s-agent
+  - nginx
+  - chronyd
+  - gitlab-runsvdir
+
+# 关键端口。这里同时是「这套环境的事实清单」——
+# 8081 那一项值得注意：Jenkins 容器内是 8080，宿主映射到 8081，
+# 所有外部回调地址都必须写 8081（详见 terraform-demo/README.md）。
+wf_audit_ports:
+  - port: 22
+    what: "SSH"
+  - port: 80
+    what: "HTTP（Harbor portal / 云上 nginx）"
+  - port: 443
+    what: "HTTPS（Harbor）"
+  - port: 8080
+    what: "HTTP 备用（Harbor portal / 云上容器栈）"
+  - port: 8081
+    what: "★ Jenkins Web（宿主端口；容器内是 8080）"
+  - port: 50000
+    what: "Jenkins 构建代理（JNLP）"
+  - port: 6443
+    what: "K3s API server"

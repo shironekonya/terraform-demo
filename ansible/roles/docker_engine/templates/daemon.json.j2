@@ -1,0 +1,27 @@
+{#-
+  Docker 守护进程配置。要改默认值请改 roles/docker_engine/defaults/main.yml。
+
+  ★ 为什么是「先构造对象、再交给 JSON 序列化」，而不是「手写花括号 + 条件标签」：
+
+    条件标签会改变换行 —— 而 trim_blocks 会把**每个**块标签后面的换行都吃掉，
+    于是很容易渲染出 `}}` 粘在一起。粘着的结果虽然仍是合法 JSON，
+    但很难读，而且下一次改动顺手就可能改坏。
+
+    交给 JSON 序列化器就没有这个问题：合法性和缩进都由它保证，
+    和我们怎么写模板空白无关。顺带也避免了「已经序列化过的字符串
+    又被嵌套序列化」那类双重编码问题。
+
+  ★ wf_docker_registry_mirrors 为空时，registry-mirrors 这个键**根本不会出现**，
+    而不是留下一个空数组 —— 空数组在 docker 眼里是无意义的配置。
+-#}
+{%- set _cfg = {
+      "log-driver": "json-file",
+      "log-opts": {
+        "max-size": wf_docker_log_max_size,
+        "max-file": wf_docker_log_max_file,
+      },
+    } -%}
+{%- if wf_docker_registry_mirrors -%}
+{%-   set _ = _cfg.update({"registry-mirrors": wf_docker_registry_mirrors}) -%}
+{%- endif -%}
+{{ _cfg | to_nice_json }}

@@ -1,0 +1,32 @@
+---
+# ===========================================================================
+# 示例：由 Terraform 生成的云服务器清单
+#
+# ★ 这个文件**故意**放在 examples/ 而不是 inventory/ 里。
+#
+#   ansible.cfg 里写的是 `inventory = inventory/`，而 Ansible 会去解析
+#   那个目录下的**所有**文件 —— 包括 .example 这种"只是给人看的"文件。
+#   实测后果是一串告警：先把 .example 当可执行脚本试（Exec format error），
+#   再当 ini 试（Invalid host pattern '---'），看起来像清单坏了。
+#
+#   规矩：inventory/ 里只放真正的清单，说明性文件放外面的 examples/。
+# ===========================================================================
+#
+# 真实文件是 inventory/hosts.cloud.yml，由下面的命令生成（已 gitignore）：
+#
+#   python3 tools/gen_cloud_inventory.py
+#
+# 它读的是 ../aliyun-ecs 的 terraform state，所以：
+#   - 必须先 terraform apply 建好实例
+#   - terraform destroy 之后要重新生成（否则清单里留着已释放的 IP）
+#
+# 这个 .example 只是给你看生成结果长什么样，不需要手工维护。
+# ===========================================================================
+
+all:
+  children:
+    cloud:
+      hosts:
+        demo-ecs-1:
+          ansible_host: 47.98.x.x # 公网 IP；未分配公网带宽时不会有这一项
+          wf_note: "阿里云 ECS · cn-hangzhou · ecs.e-c1m1.large"

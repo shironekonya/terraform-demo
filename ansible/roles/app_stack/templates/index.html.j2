@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ inventory_hostname }} · 由 Ansible 批量配置</title>
+  <style>
+    :root { color-scheme: light; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f6f7f9; color: #1f2328;
+    }
+    .card {
+      background: #fff; border: 1px solid #e5e7eb; border-radius: 12px;
+      padding: 32px 40px; box-shadow: 0 1px 3px rgba(0,0,0,.06); min-width: 380px;
+    }
+    .tag { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #6b7280; }
+    h1 { margin: 6px 0 20px; font-size: 26px; font-weight: 600; }
+    dl { display: grid; grid-template-columns: auto 1fr; gap: 8px 18px; margin: 0; font-size: 14px; }
+    dt { color: #6b7280; }
+    dd { margin: 0; font-variant-numeric: tabular-nums; }
+    .foot { margin-top: 22px; padding-top: 14px; border-top: 1px solid #f0f0f0; font-size: 12px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="tag">Ansible · 批量下发的同一份模板</div>
+    <h1>{{ inventory_hostname }}</h1>
+    <dl>
+      <dt>地址</dt><dd>{{ ansible_host | default('未指定') }}</dd>
+      <dt>发行版</dt><dd>{{ ansible_distribution | default('-') }} {{ ansible_distribution_version | default('') }}</dd>
+      <dt>内核</dt><dd>{{ ansible_kernel | default('-') }}</dd>
+      <dt>vCPU / 内存</dt><dd>{{ ansible_processor_vcpus | default('-') }} 核 / {{ ((ansible_memtotal_mb | default(0)) / 1024) | round(1) }} GB</dd>
+      <dt>容器</dt><dd>{{ wf_stack_name }}</dd>
+    </dl>
+    <div class="foot">
+      ★ 页面内容里**不能出现渲染时间**：template 模块靠「渲染结果和线上一模一样」判断要不要动手，<br>
+      时间戳每次都变 → 每次运行都会被判成「文件变了」→ 容器被无谓重启（幂等性被破坏）。<br>
+      想看部署时间，docker inspect 该容器的 StartedAt。<br>
+      文件路径 {{ wf_stack_dir }}/index.html<br>
+      这份页面由 roles/app_stack 生成。看到它，说明「一份配置批量下发到多台机器」这条链路是通的。
+    </div>
+  </div>
+</body>
+</html>

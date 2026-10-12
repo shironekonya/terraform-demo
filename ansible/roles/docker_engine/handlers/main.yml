@@ -1,0 +1,10 @@
+---
+- name: 重启 docker
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+  # 改了 daemon.json 就必须重启守护进程才生效。
+  # 注意这会连带重启所有"restart 策略不为 no"的容器 ——
+  # 在云服务器上这是可接受的（那里的容器本来就是 Ansible 管的）。
+  # 也正因为如此，这个 role 才有那条"只能用于云服务器"的断言。
+  failed_when: false

@@ -1,0 +1,129 @@
+---
+# ===========================================================================
+# guard —— 「本地服务器不覆盖」的保护机制本体
+#
+# 这个 role 必须是**每个 play 的第一个 role**（tools/check_guard.py 会静态校验）。
+# 原因：保护必须发生在任何任务之前，而不是夹在中间。
+#
+# 它做四件事：
+#   1. 判定本机是否受保护
+#   2. 断言：同一台机器不能既在 cloud 组又在 local 组
+#   3. 断言：声明了 intent=mutate 的 play，不允许包含受保护的机器  ← 核心拦截
+#   4. 打印本次运行的保护状态（"这次到底会不会动这台机器"要一眼可见）
+#
+# 为什么用「断言」而不是「用 --limit 少带机器」：
+#   靠人记住加 --limit 是流程约定，会忘；断言是代码，忘不掉。
+#   而且断言失败时给的是"你正在往本地服务器写东西"这种能直接理解的信息，
+#   不是一句 dry-run 之后的"XX changed"。
+# ===========================================================================
+
+- name: "guard · 判定本机归属"
+  ansible.builtin.set_fact:
+    wf_in_local_group: "{{ inventory_hostname in (groups['local'] | default([])) }}"
+    wf_intent: "{{ intent | default('read') }}"
+
+# ---------------------------------------------------------------------------
+# 断言 1：组归属不能自相矛盾
+#
+# cloud = 可以随便变更、随时 destroy 重建
+# local = 手工维护、默认只读
+# 一台机器不能两者都是，否则"要不要保护它"就没有答案了。
+# ---------------------------------------------------------------------------
+- name: "guard · 断言：同一台机器不能同时属于 cloud 和 local"
+  ansible.builtin.assert:
+    that:
+      - not (inventory_hostname in (groups['cloud'] | default([]))
+             and wf_in_local_group | bool)
+    fail_msg: |
+      ⛔ 清单错误：{{ inventory_hostname }} 同时出现在 cloud 和 local 两个组里。
+
+        cloud 组 = 可以任意变更、随时销毁重建
+        local 组 = 手工维护的存量环境、默认完全只读
+
+      一台机器不能两者都是，否则保护规则无从判断该不该生效。
+      请把它只保留在一个组里 —— 真正的存量机器应该留在 local。
+
+      检查一下 inventory/ 下的文件（hosts.yml 和生成的 hosts.cloud.yml）。
+    quiet: true
+  run_once: false
+
+# ---------------------------------------------------------------------------
+# 判定保护状态
+#
+# 受保护 = (组声明为受保护)  或  (本机确实落在 local 组)
+#          —— 两个条件取"或"，所以任一处标对了就保护得上，不会因为漏改一边而失效
+#
+# 再与"显式解锁开关"相与：
+#   local_mutation_allowed=true  → 解除只读（允许"只补缺"）
+#   local_overwrite_allowed=true → 再解除一层，才允许覆盖已有文件
+#
+# wf_can_write 里**同时**要求两个开关，是有意的：
+#   「能覆盖已有文件」是比「能补缺」更危险的能力，它必须蕴含后者，而不是
+#   各管各的。写成只认 local_overwrite_allowed 的话，会出现
+#   「没解锁变更、却已经拿到覆盖权限」这种反直觉状态 —— 真实路径上它被
+#   play 的 meta: end_play 挡住了，但那是靠 playbook 的写法保证的。
+#   保护公式自己就该是单调的，不该依赖调用方记得先加 gate。
+#   （tools/selftest.py 的真值表把这条固定下来了）
+#
+# 云服务器不受这两个开关影响：它从来就没被保护过。
+# ---------------------------------------------------------------------------
+- name: "guard · 计算保护状态"
+  ansible.builtin.set_fact:
+    wf_protected: >-
+      {{ ((wf_group_is_protected | default(false) | bool)
+          or (wf_in_local_group | bool))
+         and not (local_mutation_allowed | default(false) | bool) }}
+    wf_can_write: >-
+      {{ (not (wf_in_local_group | bool))
+         or ((local_mutation_allowed | default(false) | bool)
+             and (local_overwrite_allowed | default(false) | bool)) }}
+
+# ---------------------------------------------------------------------------
+# 断言 2（核心拦截）：受保护的机器不允许出现在变更型 play 里
+#
+# 正常情况下本地机器根本进不了 hosts: cloud 的 play（结构性隔离）。
+# 这条断言防的是"结构性隔离被绕过"：
+#   - 有人把 local 的机器挪进了 cloud 组
+#   - 有人把某个 play 的 hosts 从 cloud 改成了 all
+#   - 有人复制粘贴 play 时忘了改 hosts
+# 这些都会在这里被拦下，而不是等到 ss/sysctl 跑完才发现机器被改了。
+# ---------------------------------------------------------------------------
+- name: "guard · 断言：受保护的机器不允许执行变更型任务"
+  ansible.builtin.assert:
+    that:
+      - (wf_intent | string) != 'mutate'
+    fail_msg: |
+      ⛔ 已拦截：{{ inventory_hostname }} 属于「本地服务器」，但本次是变更型 play（intent=mutate）。
+
+        这台机器上跑着：{{ wf_note | default('手工维护的存量服务') }}
+        它是别人长期在用、配置一点一点攒出来的环境。Ansible 到这儿只体检，不动手。
+
+      要用 Ansible 管它，必须**显式解锁**：
+
+        # 1) 先只读体检（默认就是这一步，最安全）
+        ansible-playbook playbooks/verify.yml
+
+        # 2) 看一下变更会做什么（干跑，不落地）
+        ansible-playbook playbooks/site.yml -e local_mutation_allowed=true --check --diff
+
+        # 3) 确认无误再真跑（只补缺：装缺失的包、建缺失的目录）
+        ansible-playbook playbooks/site.yml -e local_mutation_allowed=true
+
+      即使做了第 3) 步，Ansible 也**不会覆盖任何已存在的文件或系统设置** ——
+      想连覆盖一起放开，得再给一个开关：
+        -e local_overwrite_allowed=true
+      不建议这么做，除非你已经把 /data/jenkins-data、/var/opt/gitlab 备份过了。
+  when: wf_protected | bool
+
+# ---------------------------------------------------------------------------
+# 打印本次运行的保护状态
+# ---------------------------------------------------------------------------
+- name: "guard · 本次运行的保护状态"
+  ansible.builtin.debug:
+    msg:
+      - "主机          : {{ inventory_hostname }}  ({{ ansible_host | default('未指定地址') }})"
+      - "分组          : {{ (wf_in_local_group | bool) | ternary('local  ← 本地服务器（默认只读）', 'cloud  ← 云服务器（允许变更）') }}"
+      - "本次意图      : {{ wf_intent }}{{ '  ← 会写' if (wf_intent | string) == 'mutate' else '  ← 只读' }}"
+      - "变更许可      : {{ (not (wf_protected | bool)) | ternary('✅ 允许', '⛔ 禁止（本地服务器默认只读）') }}"
+      - "覆盖已有文件  : {{ (wf_can_write | bool) | ternary('✅ 允许', '⛔ 禁止（只补缺，不覆盖）') }}"
+      - "说明          : {{ wf_note | default('-') }}"

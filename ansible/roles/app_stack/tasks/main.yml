@@ -1,0 +1,148 @@
+---
+# ===========================================================================
+# app_stack —— 在云服务器上拉起一个容器栈
+#
+# cloud-only role：第一件事就是断言"我不在本地服务器上"。
+#
+# 幂等性怎么保证（不依赖 community.docker，只用 ansible-core）：
+#   渲染 compose 文件和 index.html → 记录是否发生变化
+#   探测栈是否在运行
+#   只有 (文件变了) 或 (栈没在跑) 才执行 up -d
+# 这样重复运行的结果是 "changed=0"，而不是每次都重启一遍容器。
+# ===========================================================================
+
+- name: "app_stack · 断言：本 role 只能用于云服务器"
+  ansible.builtin.assert:
+    that:
+      - not (wf_in_local_group | bool)
+    fail_msg: |
+      ⛔ 拒绝执行：app_stack 是云服务器专用 role，但它正跑在本地服务器
+      {{ inventory_hostname }} 上。
+
+      本地服务器上的服务是手工维护的（Jenkins compose 栈 / Harbor / GitLab），
+      它们有自己的编排文件，不该被这个 role 覆盖。
+    quiet: true
+
+- name: "app_stack · 探测 docker compose（只读）"
+  ansible.builtin.command: docker compose version
+  register: wf_app_compose_probe
+  changed_when: false
+  failed_when: false
+
+- name: "app_stack · docker compose 不可用，跳过部署"
+  ansible.builtin.debug:
+    msg:
+      - "⚠ 这台机器上 `docker compose` 不可用，跳过容器栈部署。"
+      - "  先把它装上（见 docker_engine role 的提示），再重跑本 playbook。"
+  when: wf_app_compose_probe.rc != 0
+
+- name: "app_stack · 部署容器栈"
+  when: wf_app_compose_probe.rc == 0
+  block:
+
+    - name: "app_stack · 创建栈目录"
+      ansible.builtin.file:
+        path: "{{ wf_stack_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # 在控制端先验一遍：模板里的逗号/缩进写错会在这里就报错，
+    # 而不是把一份坏的 compose 文件写到机器上、up -d 失败之后才发现。
+    - name: "app_stack · 先验证 compose 渲染结果能被解析"
+      ansible.builtin.assert:
+        that:
+          - (lookup('template', 'docker-compose.yml.j2') | from_yaml) is mapping
+        fail_msg: |
+          ⛔ docker-compose.yml 模板渲染出来的内容不是合法 YAML。
+          模板：roles/app_stack/templates/docker-compose.yml.j2
+        quiet: true
+
+    - name: "app_stack · 渲染容器首页（每台机器内容不同）"
+      ansible.builtin.template:
+        src: index.html.j2
+        dest: "{{ wf_stack_dir }}/index.html"
+        owner: root
+        group: root
+        mode: "0644"
+      register: wf_stack_index
+
+    - name: "app_stack · 渲染 compose 文件"
+      ansible.builtin.template:
+        src: docker-compose.yml.j2
+        dest: "{{ wf_stack_dir }}/docker-compose.yml"
+        owner: root
+        group: root
+        mode: "0644"
+      register: wf_stack_file
+
+    - name: "app_stack · 探测栈是否在运行（只读）"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ wf_stack_dir }}/docker-compose.yml"
+          - ps
+          - -q
+        chdir: "{{ wf_stack_dir }}"
+      register: wf_stack_ps
+      changed_when: false
+      failed_when: false
+
+    # ★ 只在真的有理由时才动手：
+    #   文件变了（含首页） 或 栈里一个容器都没在跑
+    - name: "app_stack · 拉起容器栈"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ wf_stack_dir }}/docker-compose.yml"
+          - up
+          - -d
+        chdir: "{{ wf_stack_dir }}"
+      register: wf_stack_up
+      # 走到这里就说明上面已经判定"需要动手"，所以直接算 changed。
+      # （不用解析 up -d 的输出猜有没有变化 —— 那种写法很脆。）
+      changed_when: true
+      when: (wf_stack_file.changed | bool) or (wf_stack_index.changed | bool) or ((wf_stack_ps.stdout | default('') | trim) == '')
+
+    - name: "app_stack · 复核容器状态（只读）"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - compose
+          - -f
+          - "{{ wf_stack_dir }}/docker-compose.yml"
+          - ps
+        chdir: "{{ wf_stack_dir }}"
+      register: wf_stack_verify
+      changed_when: false
+      failed_when: false
+
+    - name: "app_stack · 探测 80 端口是否被系统 nginx 占着（只读）"
+      ansible.builtin.shell: |
+        if command -v ss >/dev/null 2>&1; then
+          ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | sed 's/.*://' | grep -qx 80 && echo OCCUPIED || echo FREE
+        else
+          echo UNKNOWN
+        fi
+      args:
+        executable: /bin/sh
+      register: wf_port80
+      changed_when: false
+      failed_when: false
+
+    - name: "app_stack · 部署结果"
+      ansible.builtin.debug:
+        msg:
+          - "栈目录        : {{ wf_stack_dir }}"
+          - "访问地址      : http://{{ ansible_host | default(inventory_hostname) }}:{{ wf_stack_port }}/"
+          - "本次是否动了  : {{ '是' if (wf_stack_up is changed) else '否（已是最新，changed=0）' }}"
+          - ""
+          - "容器状态："
+          - "{{ wf_stack_verify.stdout | default('(读不到)') }}"
+          - ""
+          - "关于 80 端口  : {{ '已被系统 nginx 占用（阿里云 user_data 装的），本栈用 ' ~ (wf_stack_port | string) ~ ' 不冲突' if wf_port80.stdout == 'OCCUPIED' else '当前没有服务占用 80' }}"

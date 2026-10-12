@@ -1,0 +1,69 @@
+# ---------------------------------------------------------------------------
+# 通用忽略规则
+# ---------------------------------------------------------------------------
+# Terraform 状态文件：含明文凭证与完整资源信息，绝对不能提交
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# provider 缓存与锁文件（锁文件 .terraform.lock.hcl 建议提交，见下方说明）
+.terraform/
+.terraform.tfstate.lock.info
+
+# 崩溃日志
+crash.log
+crash.*.log
+
+# 变量文件：含密钥、密码
+*.tfvars
+*.tfvars.json
+# 但 example 模板要提交，作为使用说明
+!*.tfvars.example
+
+# CLI 配置
+.terraformrc
+terraform.rc
+# 但 example 模板要提交，作为使用说明
+!terraform.rc.example
+
+# ---------------------------------------------------------------------------
+# 关于 backend.tf 的说明（远程后端，见 README「分层边界」）
+# ---------------------------------------------------------------------------
+# backend.tf 本身**建议提交**：里面只有桶名/路径/region，这些不是秘密，
+# 提交它才能保证每个人和 CI 连的是同一个后端（否则就是"在我机器上是好的"）。
+#
+# 但凭证一律不写进 backend.tf，走环境变量。如果你确实要用 -backend-config
+# 把凭证拆到单独的文件里，那种文件必须忽略：
+backend.hcl
+*.backend.hcl
+backend-*.tfvars
+
+# 计划文件：可能含敏感值
+*.tfplan
+tfplan
+
+# ---------------------------------------------------------------------------
+# 关于流水线的产物（见 .gitlab-ci.yml）
+# ---------------------------------------------------------------------------
+# .ci-artifacts/ 里是 Terraform 那一侧交给 Ansible 的**唯一**输入。
+# 它是流水线内部的传递物，而且可能含内网 IP、连接串这类信息 —— 不入库。
+# （这个目录本身就是「跨层衔接看得见」的证据：谁写的、谁读的，一个文件说清楚。）
+.ci-artifacts/
+plan.json
+
+# 覆盖文件
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# ---------------------------------------------------------------------------
+# 关于 .terraform.lock.hcl 的说明
+# ---------------------------------------------------------------------------
+# 这个文件记录 provider 的精确版本与哈希，**应该提交到版本库**，
+# 以保证团队/CI 拿到完全一致的 provider。
+# 如果你在多个平台（Windows/Linux/macOS）协作，建议执行：
+#     terraform providers lock -platform=windows_amd64 \
+#         -platform=linux_amd64 -platform=darwin_arm64
+# 下面这行是给不想处理多平台锁文件的场景用的，默认注释掉：
+# .terraform.lock.hcl

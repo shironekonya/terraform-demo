@@ -1,0 +1,47 @@
+# ===========================================================================
+# 远程后端模板（阿里云 OSS + TableStore 状态锁）
+#
+# ★★ 这个文件默认**不生效**（Terraform 只加载 *.tf / *.tf.json），
+#    仓库开箱即可用本地 state。启用方法见 aliyun-ecs/backend.tf.example 的头部说明，
+#    或者直接看 README 的「分层边界」一节。
+#
+# ★ 为什么本地这套（VMware Workstation 虚机）也用 OSS？
+#   因为"state 放哪"和"被管的资源在哪"是两件独立的事。
+#   本地虚机同样需要防并发覆盖、同样需要让 state 离开个人电脑。
+#   用同一个 OSS 桶 + 不同的 prefix/key，团队只需要维护一套后端。
+#
+#   如果你们的本地环境不许依赖公有云，等价替换方案（都自带锁）：
+#     - backend "pg"       ：一台内网 PostgreSQL，connection_string 指向它
+#     - backend "consul"    ：内网 Consul
+#     - backend "s3" + MinIO：内网对象存储；TF >= 1.10 可用 use_lockfile = true
+#                             （1.10 起 S3 后端可用文件锁替代已废弃的 DynamoDB 锁）
+#   接口一样，换的只是这一段，playbook 和脚本都不用动。
+# ===========================================================================
+
+terraform {
+  backend "oss" {
+    bucket = "<你的-state-bucket>"                 # 可以和 aliyun-ecs 用同一个桶
+    prefix = "terraform-demo/vmware-workstation" # ★ 不同 prefix，互不干扰
+    key    = "terraform.tfstate"
+    region = "cn-hangzhou"
+    acl    = "private"
+
+    # 状态锁：两项必须同时给，缺一个就等于没有锁
+    tablestore_endpoint = "https://<你的-ots-实例>.cn-hangzhou.ots.aliyuncs.com"
+    tablestore_table    = "<你的-锁表名>" # 表主键必须是 LockID / String
+
+    encrypt = true
+  }
+}
+
+# ---------------------------------------------------------------------------
+# 迁移操作（本地已经是本地 state 的情况下，顺序别弄反）
+#
+#   cd vmware-workstation
+#   cp backend.tf.example backend.tf     # 填好占位符
+#   terraform init -migrate-state        # 提示是否复制本地 state → 选 yes
+#   terraform plan                       # ★ 必须是 "No changes"，
+#                                        #   否则说明 state 没搬对，别继续 apply
+#
+# ★ 迁移前先备份一份：cp terraform.tfstate terraform.tfstate.bak
+# ---------------------------------------------------------------------------

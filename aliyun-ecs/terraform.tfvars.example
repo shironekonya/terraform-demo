@@ -1,0 +1,23 @@
+# 复制成 terraform.tfvars 后按需修改。此文件含敏感信息，务必加入 .gitignore。
+
+region       = "cn-hangzhou"
+environment  = "demo"
+
+vpc_cidr     = "10.10.0.0/16"
+vswitch_cidr = "10.10.1.0/24"
+zone_id      = "" # 留空自动选择
+
+instance_count = 1
+instance_type  = "ecs.e-c1m1.large"
+
+# 公网出带宽，0 则不开公网 IP（更省钱，可走 EIP 或跳板机）
+internet_max_bandwidth_out = 5
+
+# 强烈建议收敛到这里，例如 "1.2.3.4/32"
+ssh_allowed_cidr = "0.0.0.0/0"
+
+# 方式一：SSH 密钥对（推荐）。填入你的公钥内容，如 ssh-ed25519 AAAA...
+ssh_public_key = ""
+
+# 方式二：实例密码。仅当 ssh_public_key 为空时生效
+instance_password = ""

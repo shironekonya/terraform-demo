@@ -1,0 +1,8 @@
+---
+- name: 重新加载 sysctl
+  ansible.builtin.command: sysctl --system
+  changed_when: true
+  # handler 只会被 notify 它的任务触发，而那个任务本身已经带了 wf_can_write 门。
+  # 这里再加一道，是因为 `sysctl --system` 会加载 /etc/sysctl.d/ 下的**所有**文件，
+  # 不只是我们写的那一个 —— 它的实际影响范围比"我们改了什么"更大。
+  when: wf_can_write | bool

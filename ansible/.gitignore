@@ -1,0 +1,12 @@
+# ── 由 Terraform 生成，含真实公网 IP，不进版本库 ──
+# 生成方式：python3 tools/gen_cloud_inventory.py
+inventory/hosts.cloud.yml
+
+# ── Ansible 运行期产物 ──
+.cache/          # fact 缓存（jsonfile）
+reports/         # 只读体检报告，写在控制端
+*.retry
+
+# ── 跑 tools/ 下的脚本时产生的字节码 ──
+__pycache__/
+*.py[cod]

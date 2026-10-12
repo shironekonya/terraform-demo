@@ -1,0 +1,91 @@
+---
+# ===========================================================================
+# 施加基线
+#
+# 本文件只在 wf_protected == false 时被 include（见 tasks/main.yml）。
+#
+# ★ 权限模型 —— 这是「本地服务器不覆盖」最具体的一层：
+#
+#   不带 when 的任务      = "只新增不存在的对象"（装缺失的包、建缺失的目录）
+#                            → 本地服务器在 -e local_mutation_allowed=true 下可以走
+#
+#   when: wf_can_write    = "会覆盖/改写已存在的东西"
+#                            → 本地服务器还需要 -e local_overwrite_allowed=true
+#
+#   新增一个写入类任务时，先问自己它属于哪一类，再决定要不要加 when。
+#   tools/check_guard.py 会强制这一点：凡是在"可能跑在本地"的 role 里出现的
+#   写入类任务，都必须带 wf_can_write / wf_protected 之类的门。
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 第 1 类：只新增，不覆盖
+# ---------------------------------------------------------------------------
+
+- name: "baseline · 补装缺失的基础包（只在缺失时执行）"
+  ansible.builtin.package:
+    name: "{{ wf_missing_packages }}"
+    state: present
+  when: (wf_missing_packages | length) > 0
+
+- name: "baseline · 创建缺失的目录（已存在的一律不碰）"
+  ansible.builtin.file:
+    path: "{{ item.item }}"
+    state: directory
+    mode: "0755"
+  loop: "{{ wf_dir_stat.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not (item.stat.exists | bool)
+
+# ---------------------------------------------------------------------------
+# 第 2 类：会覆盖/改写 —— 本地服务器必须显式再解锁一层
+# ---------------------------------------------------------------------------
+
+- name: "baseline · 设置时区（会替换 /etc/localtime）"
+  ansible.builtin.file:
+    src: "/usr/share/zoneinfo/{{ wf_timezone }}"
+    dest: "{{ wf_timezone_file }}"
+    state: link
+    force: true
+  when: wf_can_write | bool
+
+- name: "baseline · 写入内核参数（会覆盖 99-wf.conf）"
+  ansible.builtin.template:
+    src: 99-wf-sysctl.conf.j2
+    dest: "{{ wf_sysctl_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: wf_can_write | bool
+  notify: 重新加载 sysctl
+
+- name: "baseline · 写入文件描述符上限（会覆盖 99-wf.conf）"
+  ansible.builtin.template:
+    src: 99-wf-limits.conf.j2
+    dest: "{{ wf_limits_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+  when: wf_can_write | bool
+
+- name: "baseline · 启用时间同步服务"
+  ansible.builtin.systemd:
+    name: "{{ wf_chrony_service }}"
+    enabled: true
+    state: started
+  # 服务不存在时不要中断整场运行（本地服务器上可能没装 chrony，
+  # 而没装恰恰是"受保护 → 不能补装"的正常结果）。
+  failed_when: false
+  when: wf_can_write | bool
+
+# ---------------------------------------------------------------------------
+# 刻意不做的事
+# ---------------------------------------------------------------------------
+
+- name: "baseline · 防火墙：有意不做任何改动"
+  ansible.builtin.debug:
+    msg:
+      - "跳过防火墙配置 —— 这是刻意的。"
+      - "这套环境全部通过 SSH 远程管理，而远程改防火墙规则最容易的结果是"
+      - "把自己锁在门外（规则生效、连接断掉、再也连不上）。"
+      - "要配防火墙请在本机控制台操作，并先加一条放行「你当前的 SSH 来源」的规则。"

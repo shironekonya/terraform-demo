@@ -1,0 +1,227 @@
+# ===========================================================================
+# 基础设施流水线 —— 变更的唯一触发器
+# ===========================================================================
+#
+# 为什么要有这个文件
+#
+#   「Terraform 管资源生命周期、Ansible 管节点和服务状态」这两条边界，
+#   在没人管「谁来触发」的时候是守不住的：每个人在自己机器上手跑
+#   terraform apply 和 ansible-playbook，就必然要回答「以谁的本地环境为准」。
+#   这个文件把变更收敛成一条路径：git push → 流水线。
+#
+# 三条设计约束（tools/check_boundaries.py 的 B7 会逐条检查，改坏了会红）
+#
+#   1. Terraform 与 Ansible 是两个**独立 job**，谁都不调用谁。
+#      数据靠 artifact 传：plan job 产出 tf-outputs.json，
+#      configure job 消费它。Ansible 那个 job 里没有 state、没有云凭证，
+#      也就没有能力越界 —— 这是"做不到"，不是"约好了不做"。
+#
+#   2. 变更类动作必须人工放行（when: manual）。
+#      validate / plan / 只读体检自动跑；apply、碰本机组的 job、teardown
+#      都必须有人点那一下。
+#
+#   3. Ansible 的 job 一律显式 --limit。
+#      不加限定的 site.yml 会连带碰到本地服务器 —— 虽然 roles/guard 拦得住，
+#      但流水线里不该依赖"拦得住"，该直接不碰。
+#
+# ---------------------------------------------------------------------------
+# 需要预先配置的 CI/CD 变量（Settings → CI/CD → Variables）
+#
+#   ALICLOUD_ACCESS_KEY     Masked。alicloud provider 和 OSS backend 共用
+#   ALICLOUD_SECRET_KEY     Masked
+#   WF_SSH_KEY_FILE         File 类型。部署用的 SSH 私钥
+#   WF_SSH_USER             普通变量，默认 root
+#
+#   注意：plan job 的 artifact 里有 tfplan 的 JSON 展开，可能包含敏感值。
+#   它的 expire_in 是 1 天，并且应该配合「限制 artifact 下载权限」一起用。
+#
+# ---------------------------------------------------------------------------
+# 对 runner 的要求
+#
+#   terraform + python3 + ansible-core >= 2.14，并且：
+#     · 能访问对象存储（远程 state 后端）和云 API
+#     · 能 SSH 到云机器
+#     · 能 SSH 到本地服务器那两台（否则改成 --limit cloud）
+#   建议把 terraform provider 缓存挂到 runner 上（TF_PLUGIN_CACHE_DIR），
+#   否则每次 init 都要重新下载 provider。
+# ===========================================================================
+
+stages:
+  - validate
+  - plan
+  - apply
+  - configure
+  - verify
+  - teardown
+
+variables:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_ROOT: "$CI_PROJECT_DIR/aliyun-ecs"
+  ANSIBLE_ROOT: "$CI_PROJECT_DIR/ansible"
+  # Terraform 交给 Ansible 的唯一输入，就走这个目录
+  ARTIFACT_DIR: "$CI_PROJECT_DIR/.ci-artifacts"
+  WF_SSH_USER: "root"
+
+default:
+  tags:
+    - wf-infra
+  before_script:
+    - set -eo pipefail
+
+# 避免 push 和 MR 各触发一条流水线（GitLab 的老问题）
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# 1. validate：不需要任何凭证、不碰任何机器，先把边界和语法过一遍
+# ---------------------------------------------------------------------------
+
+validate:boundaries:
+  stage: validate
+  script:
+    - echo "── 分层边界静态校验 ──"
+    - python3 tools/check_boundaries.py --require-remote-state --require-ci
+    - echo
+    - echo "── Ansible 侧护栏（纯离线，不需要机器）──"
+    - cd ansible
+    - python3 tools/check_guard.py
+    - python3 tools/check_guard.py --selftest
+    - python3 tools/selftest.py
+
+validate:terraform:
+  stage: validate
+  script:
+    - cd "$TF_ROOT"
+    - terraform fmt -check -recursive
+    # -backend=false：语法与引用校验不需要后端，也就不需要凭证
+    - terraform init -backend=false -input=false
+    - terraform validate
+
+# ---------------------------------------------------------------------------
+# 2. plan：读得到 state、算得出差异，但不改任何东西
+# ---------------------------------------------------------------------------
+
+plan:
+  stage: plan
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -input=false -lock-timeout=5m
+    - terraform plan -input=false -lock-timeout=5m -out=tfplan
+    - terraform show -json tfplan > plan.json
+    # ★ 这一份是给 Ansible 那一侧的**唯一**输入。
+    #   而不是让 Ansible 自己去调 terraform —— 那会让它重新需要一套云凭证。
+    - mkdir -p "$ARTIFACT_DIR"
+    - terraform output -json > "$ARTIFACT_DIR/tf-outputs.json"
+  artifacts:
+    name: "tf-plan-$CI_COMMIT_SHORT_SHA"
+    # tfplan 是二进制计划文件，内容含明文敏感值 —— 过期要短
+    expire_in: 1 day
+    paths:
+      - aliyun-ecs/tfplan
+      - aliyun-ecs/plan.json
+      - .ci-artifacts/
+
+# ---------------------------------------------------------------------------
+# 3. apply：人工放行。用的是 plan 里那份**被看过**的计划，不是重新算一遍
+# ---------------------------------------------------------------------------
+
+apply:
+  stage: apply
+  needs:
+    - job: plan
+      artifacts: true
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -input=false -lock-timeout=5m
+    - terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
+    # apply 之后输出会变（新机器有 IP 了），重新导出给下一段用
+    - mkdir -p "$ARTIFACT_DIR"
+    - terraform output -json > "$ARTIFACT_DIR/tf-outputs.json"
+  artifacts:
+    name: "tf-outputs-$CI_COMMIT_SHORT_SHA"
+    expire_in: 1 day
+    paths:
+      - .ci-artifacts/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+
+# ---------------------------------------------------------------------------
+# 4. configure：Ansible 上场。它只消费 artifact，不调用 terraform
+# ---------------------------------------------------------------------------
+
+configure:cloud:
+  stage: configure
+  needs:
+    # apply 是 manual 的，可能没跑（比如这次只改了 Ansible 的 playbook）——
+    # 那时候用 plan 阶段的输出就够了，所以 optional
+    - job: apply
+      artifacts: true
+      optional: true
+    - job: plan
+      artifacts: true
+  script:
+    - cd "$ANSIBLE_ROOT"
+    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE"
+    - ansible-playbook playbooks/site.yml --limit cloud
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+configure:local:
+  stage: configure
+  needs:
+    - job: apply
+      artifacts: true
+      optional: true
+    - job: plan
+      artifacts: true
+  script:
+    - cd "$ANSIBLE_ROOT"
+    - echo "本地服务器默认完全只读。要真的动手，得先有人点这一下 ——"
+    - echo "而且命令里还要显式带上解锁开关。两道门都要过。"
+    - ansible-playbook playbooks/site.yml --limit local -e local_mutation_allowed=true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+
+# ---------------------------------------------------------------------------
+# 5. verify：只读验收。性质是「跑完之后，任何被管机器的 changed 都必须是 0」
+# ---------------------------------------------------------------------------
+
+verify:readonly:
+  stage: verify
+  needs:
+    - job: apply
+      artifacts: true
+      optional: true
+    - job: plan
+      artifacts: true
+  script:
+    - cd "$ANSIBLE_ROOT"
+    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE" --quiet
+    # 默认同时验收云机器和本地服务器；runner 不在同一网段时改成 --limit cloud
+    - ansible-playbook playbooks/verify.yml --limit "cloud,local"
+    - echo "验收性质：上面这条的 changed 必须是 0。不为 0 说明有东西没收敛。"
+
+# ---------------------------------------------------------------------------
+# 6. teardown：最危险的动作，同样走人工放行
+#    （放在最后一段，是为了让它在流水线界面上永远要你主动去点）
+# ---------------------------------------------------------------------------
+
+teardown:
+  stage: teardown
+  script:
+    - cd "$TF_ROOT"
+    - terraform init -input=false -lock-timeout=5m
+    - terraform destroy -input=false -lock-timeout=5m -auto-approve
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false

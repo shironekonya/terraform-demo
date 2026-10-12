@@ -1,0 +1,32 @@
+---
+# ===========================================================================
+# baseline —— 机器基线
+#
+# 这个 role 有两副面孔，取决于 guard 算出来的 wf_protected：
+#
+#   受保护（本地服务器，默认） → 只跑 detect + report，一个字节都不改
+#   未受保护（云服务器 / 已解锁的本地） → 再跑 apply
+#
+# "两副面孔装在一个 role 里"是有意的：
+#   检测和施加用的是同一份定义（roles/baseline/defaults/main.yml），
+#   所以"报告里说缺什么"和"实际去装什么"永远不会对不上。
+# ===========================================================================
+
+- name: "baseline · 检测差异（只读）"
+  ansible.builtin.include_tasks: detect.yml
+
+- name: "baseline · 汇总（只读）"
+  ansible.builtin.include_tasks: report.yml
+
+- name: "baseline · 应用变更"
+  ansible.builtin.include_tasks: apply.yml
+  when: not (wf_protected | bool)
+
+- name: "baseline · 本机受保护，已跳过全部变更"
+  ansible.builtin.debug:
+    msg:
+      - "⛔ {{ inventory_hostname }} 属于本地服务器 → 本次不做任何变更。"
+      - "   上面那份「差异清单」就是『只补缺』路径下唯一会被处理的东西。"
+      - "   真要处理它：ansible-playbook playbooks/site.yml -e local_mutation_allowed=true"
+      - "   注意：即使那样也仍然不会覆盖已存在的文件（需要再加 -e local_overwrite_allowed=true）。"
+  when: wf_protected | bool

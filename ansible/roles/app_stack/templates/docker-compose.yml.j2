@@ -1,0 +1,27 @@
+# ---------------------------------------------------------------------------
+# 由 Ansible 渲染（roles/app_stack）—— 手工修改会在下次运行 playbook 时被覆盖。
+#
+# 每台云服务器拿到的是**同一份模板**，但渲染结果里带着它自己的身份：
+# 容器名、首页里的主机名与地址。这就是「批量配置」最直观的样子 ——
+# 一份模板下发到 N 台机器，各显示各的。
+#
+# 刻意不写 `version:` 字段：compose v2 已经废弃它，写了会收到一条警告。
+# ---------------------------------------------------------------------------
+services:
+  {{ wf_stack_name }}:
+    image: {{ wf_stack_image }}
+    container_name: {{ wf_stack_name }}
+    restart: unless-stopped
+    ports:
+      - "{{ wf_stack_port }}:80"
+    volumes:
+      - {{ wf_stack_dir }}/index.html:/usr/share/nginx/html/index.html:ro
+    environment:
+      WF_HOST: "{{ inventory_hostname }}"
+      WF_ADDR: "{{ ansible_host | default('') }}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -1,0 +1,83 @@
+---
+# ===========================================================================
+# 只读检测：这台机器离「基线」还差什么
+#
+# 全部只读 —— 本文件里不允许出现任何会改变被管机器的任务。
+# tools/check_guard.py 会检查这一点。
+# ===========================================================================
+
+- name: "baseline · 读取已安装包清单（只读）"
+  ansible.builtin.package_facts:
+    manager: auto
+  failed_when: false
+
+- name: "baseline · 计算缺失的包（只读）"
+  ansible.builtin.set_fact:
+    wf_missing_packages: >-
+      {{ wf_base_packages
+         | reject('in', (ansible_facts.packages | default({})) | list)
+         | list }}
+
+- name: "baseline · 检查目标目录是否存在（只读）"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ wf_base_dirs }}"
+  loop_control:
+    label: "{{ item }}"
+  register: wf_dir_stat
+  changed_when: false
+
+- name: "baseline · 计算缺失的目录（只读）"
+  ansible.builtin.set_fact:
+    wf_missing_dirs: >-
+      {{ wf_dir_stat.results
+         | rejectattr('stat.exists')
+         | map(attribute='item')
+         | list }}
+
+- name: "baseline · 检查受管文件是否存在（只读）"
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop: "{{ wf_managed_conf_files }}"
+  loop_control:
+    label: "{{ item }}"
+  register: wf_conf_stat
+  changed_when: false
+
+- name: "baseline · 计算已存在的受管文件（只读）"
+  ansible.builtin.set_fact:
+    wf_existing_conf: >-
+      {{ wf_conf_stat.results
+         | selectattr('stat.exists')
+         | map(attribute='item')
+         | list }}
+
+# ---------------------------------------------------------------------------
+# 第三道保险：确认自己不会写到"本地服务器的禁区"里去
+#
+# 前两道（结构性隔离 + guard 断言）保证的是"不会有任务跑在本地服务器上"。
+# 这一道保证的是"就算跑了，也不会写到那些改了就等于抹掉现状的目录"。
+#
+# 用 wf_under_any 而不是字符串 startswith：
+#   /data/jenkins-data-OLD 不是 /data/jenkins-data 的子路径，
+#   但它是字符串前缀 —— 用 startswith 会误报，从而误伤正常路径。
+# ---------------------------------------------------------------------------
+- name: "baseline · 断言：写入目标不得落在本地禁区路径下"
+  ansible.builtin.assert:
+    that:
+      - wf_forbidden_hits | length == 0
+    fail_msg: |
+      ⛔ 拒绝执行：baseline 要写的路径落在「本地服务器禁区」里。
+
+      命中：{{ wf_forbidden_hits | join(', ') }}
+
+      禁区清单在 group_vars/local.yml 的 wf_local_forbidden_paths。
+      这些目录是本地服务器上"改了就等于抹掉现状"的东西
+      （Jenkins 数据、GitLab 仓库、K3s 配置…）。
+      要么改掉 baseline 的写入目标，要么把该路径从禁区清单里移除 ——
+      但请先想清楚为什么它会在禁区里。
+    quiet: true
+  vars:
+    wf_write_targets: "{{ wf_base_dirs + wf_managed_conf_files }}"
+    wf_forbidden_hits: >-
+      {{ wf_write_targets | wf_under_any(wf_local_forbidden_paths | default([])) }}

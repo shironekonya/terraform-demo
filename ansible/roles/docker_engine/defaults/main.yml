@@ -1,0 +1,31 @@
+---
+# ---------------------------------------------------------------------------
+# 包名按发行版族区分
+#
+# Alibaba Cloud Linux / RHEL 系 : docker / docker-compose-plugin
+# Ubuntu / Debian 系            : docker.io / docker-compose-v2
+#
+# 这里用的是**发行版仓库**里的包，不是 Docker 官方 CE 源。
+# 理由：官方源要按发行版加 GPG key + 仓库文件，分支多、又容易受网络影响；
+#      而官方源的主要卖点是"版本新"，本 demo 不需要。
+# 要用官方 CE 源的话，在这里加两个 apt_repository / yum_repository 任务即可。
+# ---------------------------------------------------------------------------
+wf_docker_package: "{{ 'docker' if ansible_os_family == 'RedHat' else 'docker.io' }}"
+wf_docker_compose_package: "{{ 'docker-compose-plugin' if ansible_os_family == 'RedHat' else 'docker-compose-v2' }}"
+
+# 要加入 docker 组的用户。留空 = 一个都不动。
+wf_docker_users: []
+
+# ---------------------------------------------------------------------------
+# 日志轮转 —— 默认开启
+#
+# 不限制容器日志大小是云主机"系统盘突然满掉"的最常见原因：
+# 一个话多的容器几天就能写几十 GB，而磁盘满了不会报"磁盘满"，
+# 现象是 kubelet/docker 各种莫名其妙的失败。
+# 这几项也可以在 group_vars/cloud.yml 里按环境覆盖。
+# ---------------------------------------------------------------------------
+wf_docker_log_max_size: "10m"
+wf_docker_log_max_file: "3"
+
+# 镜像加速地址，例如 ["https://xxxx.mirror.aliyuncs.com"]
+wf_docker_registry_mirrors: []

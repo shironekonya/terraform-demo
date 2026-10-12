@@ -1,0 +1,220 @@
+# ===========================================================================
+# 复制成 terraform.tfvars 后按你本机实际情况修改
+#
+# 最重要的一件事：下面这两个 IP 和 SSH 私钥路径必须改成你自己的。
+# 用 terraform apply 的盘点输出可以核对。
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# 1) K3s 主节点（跑着 Jenkins + Harbor 的那台）
+# ---------------------------------------------------------------------------
+k3s_server = {
+  name    = "k3s-server"
+  host    = "192.168.1.101"          # ← 改成你主节点的实际 IP
+  user    = "ubuntu"                 # ← 改成你的登录用户
+  ssh_key = "~/.ssh/id_ed25519"      # ← 改成你的私钥路径
+}
+
+# ---------------------------------------------------------------------------
+# 2) K3s 从节点（仅盘点，不改动）
+# ---------------------------------------------------------------------------
+k3s_agent = {
+  name    = "k3s-agent"
+  host    = "192.168.1.102"          # ← 改成你从节点的实际 IP
+  user    = "ubuntu"
+  ssh_key = "~/.ssh/id_ed25519"
+}
+
+ssh_port = 22
+
+# ---------------------------------------------------------------------------
+# 3) Jenkins（docker-compose 栈）
+#
+# ★ 下面的值全部取自你实际在跑的 /data/jenkins-data/docker-compose.yaml。
+#
+#   ★★ 最要紧的一项：端口。宿主是 8081，容器内是 8080。
+#      所有从外部访问 Jenkins 的地址（Harbor / GitLab 的 webhook）都必须写 8081。
+#      写 8080 的后果是「静默失效」—— 回调打到没人监听的端口，
+#      而 Harbor / GitLab 都不当致命错误，现象只是「流水线毫无反应」。
+# ---------------------------------------------------------------------------
+jenkins_container_name = "jenkins"
+jenkins_image          = "jenkins/jenkins:2.555.3-lts"
+jenkins_http_port      = 8081                  # ← 宿主端口，不是容器内的 8080
+jenkins_agent_port     = 50000                 # JNLP 构建代理
+jenkins_home_dir       = "/data/jenkins-data"  # bind mount 到容器 /var/jenkins_home
+jenkins_compose_dir    = "/data/jenkins-data"  # compose 文件所在目录
+
+# compose 模板里会渲染的几项（对应你原 compose 的 TZ / 镜像站 / 资源限制）
+jenkins_tz           = "Asia/Shanghai"
+jenkins_uc_mirror    = "https://mirrors.huaweicloud.com/jenkins"  # 国内装插件必需
+jenkins_cpu_limit    = "2"
+jenkins_memory_limit = "2G"   # ⚠ 构建内存峰值超 2G 会被 OOM Kill，现象是 Jenkins 突然消失
+
+# ---------------------------------------------------------------------------
+# 4) Harbor（docker-compose 栈，官方默认配置）
+#
+# ⚠ manage_harbor 恒为 false，请不要改。理由见 variables.tf 里的详细说明：
+#   Harbor 默认配置就是约 9 个容器的 compose 栈（nginx/portal/core/registry/
+#   registryctl/db/redis/jobservice/log），官方没有单容器发行版，
+#   技术上无法用 Terraform 接管容器层 —— 强行接管会重建整个镜像仓库。
+#   它的容器与配置归 docker compose + harbor.yml 管。
+#   下面两个端口只用于在输出里显示访问地址。
+# ---------------------------------------------------------------------------
+manage_harbor     = false
+harbor_http_port  = 80
+harbor_https_port = 443
+
+# ---------------------------------------------------------------------------
+# 5) 总开关
+#
+# ★ 强烈建议第一次保持 false，先只读盘点。
+#   false = 只看不动，反复 apply 都很安全
+#   true  = 核对 Jenkins compose 栈（是否真的动手由下面一项再决定）
+# ---------------------------------------------------------------------------
+manage_containers = false
+
+# ★ 是否由 Terraform 覆写 Jenkins 的 compose 文件。默认 false。
+#
+#   false = 只核对（推荐）。逐项比对「运行中的容器」和「磁盘上的 compose 文件」，
+#           列出差异但一行都不改。用来确认 Terraform 的理解与你的现实一致。
+#   true  = 接管。有差异时按模板覆写 docker-compose.yaml 并重启栈
+#           （覆写前自动备份为 .bak.<时间戳>）。
+#
+#   ⚠ 你的 compose 文件里手工挂了 docker.sock / k3s / kubectl / .kube 四项。
+#     让 Terraform 接管后就按模板生成 —— 想改挂载得改模板文件。
+#     如果你更愿意继续手工维护那份文件，保持 false 即可，核对模式同样有价值。
+jenkins_manage_compose = false
+
+container_restart_policy = "always"   # 与你 compose 里的 restart 一致
+
+# destroy 时是否停止 Jenkins 栈。默认 false：
+# 你多半只是想撤掉 Terraform 这层管理，而不是想让 CI 停摆。
+# 改成 true 也只是 compose stop（容器保留），绝不会删数据。
+jenkins_stack_down_on_destroy = false
+
+# ===========================================================================
+# 6) CI/CD 流水线（第三阶段）
+#
+# 把「Harbor 项目 + webhook + Jenkins 任务」这套配置变成代码。
+# 默认 false，同样建议先看清现状再接管。
+# ===========================================================================
+
+manage_cicd = false
+
+# --- Harbor API ---
+# 脚本在主节点上执行，所以用 localhost（Harbor 端口映射到宿主机 80）
+harbor_url            = "http://localhost"
+harbor_project        = "apps"
+harbor_admin_user     = "admin"
+harbor_admin_password = ""   # ★ 建议用环境变量 TF_VAR_harbor_admin_password 传，别写进文件
+
+# --- Jenkins API ---
+# ★ 端口是 8081（宿主端口）。8080 是容器内部的端口，从宿主机访问不到。
+jenkins_url          = "http://localhost:8081"
+jenkins_admin_user   = "admin"
+jenkins_api_token    = ""    # ★ API Token，不是登录密码。同样建议用 TF_VAR_ 传
+
+# --- Harbor Webhook ---
+harbor_webhook_name = "jenkins-deploy-trigger"
+
+# ★★ 最容易配错的一项：必须写「主节点 IP」，绝对不能写 localhost。
+#    因为 Harbor 跑在容器里，容器内的 localhost 是它自己，到不了 Jenkins。
+#    需要 Jenkins 安装 Generic Webhook Trigger 插件。
+webhook_endpoint_url = ""
+#    例: "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=你的token"
+#        ★ 端口是 8081。写错端口时的现象是「流水线毫无反应」，两边都不报错 ——
+#          apply 输出的安全检查段落会帮你核对端口是否一致。
+
+# webhook 的认证头，Harbor 会原样附加到请求上，供 Jenkins 校验来源
+webhook_auth_header = ""
+
+# ★★★ 只监听 PUSH_ARTIFACT，不要加 PULL_ARTIFACT！
+#     部署任务本身要拉镜像，监听拉取事件会造成
+#       部署 -> 拉镜像 -> 触发 webhook -> 再部署 -> ... 无限循环
+#     代码里已加校验，填了 PULL_ARTIFACT 会直接报错。
+webhook_event_types = ["PUSH_ARTIFACT"]
+
+# --- Jenkins 任务（默认不接管）---
+# 任务逻辑应该写在应用仓库的 Jenkinsfile 里，Terraform 只保证任务壳正确。
+# 已手工建好任务的话，保持 false 即可。
+manage_jenkins_job        = false
+jenkins_deploy_job_name   = "deploy-app"
+jenkins_job_repo_url      = ""
+jenkins_job_branch        = "*/main"
+jenkinsfile_path          = "Jenkinsfile"
+
+# --- destroy 行为 ---
+# ★ 默认 false：destroy 时保留 Harbor webhook，避免打断正在跑的流水线。
+#   只有确认这些配置完全由 Terraform 创建时才改成 true。
+cicd_cleanup_on_destroy = false
+
+# ===========================================================================
+# 7) GitLab 流水线入口（第四阶段）
+#
+# 从节点上跑着 GitLab（Omnibus 包安装的实体服务，非 Docker 容器），
+# 它是整条流水线的起点：
+#   git push -> GitLab -> (Push Hook) -> Jenkins -> Harbor -> Jenkins -> K3s
+#
+# ★ 实体服务的含义：Terraform 不接管 GitLab 服务本身（启停/配置归
+#   systemctl + gitlab-ctl 管），只接管它上面的 API 层：项目 + webhook。
+#
+# 注意 GitLab 和 Jenkins **不在同一台机器上**，这让两个地方容易配错，
+# 代码里都加了校验，见下面 ★ 标记。
+# ===========================================================================
+
+# --- GitLab 地址 ---
+# 留空 = 自动取 http://<从节点IP>
+# 必须与 /etc/gitlab/gitlab.rb 里的 external_url 一致（含端口/协议形式），
+# 不一致时 GitLab 可能返回重定向导致 API 调用失败。
+gitlab_external_url = ""
+
+# --- GitLab 项目 + Push Webhook ---
+# 默认 false。建议第二步就开这一项（GitLab 服务本身始终不碰），
+# 因为它最隐蔽：配错了现象是「推了代码但流水线没动静」。
+manage_gitlab_cicd = false
+
+# ★ API Token，需要 api scope + 管理员权限（改「本地网络放行」是实例级设置）
+#   生成方式（任选其一）：
+#     1) 界面：用户设置 -> Access Tokens -> 勾 api -> 生成
+#     2) 命令行（在从节点执行，会打印出 token）：
+#        sudo gitlab-rails runner "u=User.find_by_username('root'); t=u.personal_access_tokens.new(scopes: ['api'], name: 'terraform-managed', expires_at: 365.days.from_now); t.save!; puts t.token"
+#   建议用环境变量 TF_VAR_gitlab_api_token 传，不要写进文件。
+gitlab_api_token = ""
+
+gitlab_project_name       = "demo-app"
+gitlab_project_path       = ""        # 留空 = 与项目名相同；写 "group/project" 可建在群组下
+gitlab_project_visibility = "private"
+
+# ★★ 最容易配错的一项：必须写【主节点 IP】，绝对不能写 localhost。
+#    GitLab 在从节点上，写 localhost 会请求它自己，永远到不了 Jenkins。
+#    代码里已加校验，填 localhost / 127.0.0.1 会直接报错。
+#    需要 Jenkins 安装 Generic Webhook Trigger 插件。
+gitlab_webhook_endpoint_url = ""
+#    例: "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=构建任务的token"
+#        ★ 端口是 8081（Jenkins 宿主端口），不是 8080。
+
+# webhook secret token：GitLab 会在 X-Gitlab-Token 头里原样带上，供 Jenkins 校验来源。
+# 注意与上面 URL 里那个 token 不是一回事（那个用于路由到具体任务）。
+gitlab_webhook_token = ""
+
+# 分支过滤，留空 = 所有分支都触发。建议设置，否则任何临时分支的 push 都会触发构建。
+gitlab_push_branch_filter = ""
+#    例: "main" 或 "release/*" 或 "*-stable"
+
+gitlab_enable_ssl_verification = false   # 内网 Jenkins 多为 http/自签证书，故默认 false
+
+# ★★★ 是否允许 GitLab 回调私有网段，默认 true，实验环境必须保持 true。
+#     GitLab 从 10.6 起默认拦截 127.0.0.1 / 10.0.0.0/8 / 172.16.0.0/12 / 192.168.0.0/16，
+#     而你的链路整条都在私有网段里。
+#     不开这个开关，push 之后 webhook 会被静默拦截 ——
+#     现象是「代码推上去了但流水线没动静」，GitLab 界面也没有明显报错，极难排查。
+gitlab_allow_local_requests = true
+
+# ★ 是否在 apply 时发一次真实测试事件来验证链路。
+#   好处：这是唯一能证明「GitLab 真能打到 Jenkins」的方法，会返回真实响应码。
+#   代价：真的会触发一次完整流水线（构建 -> 推镜像 -> 部署）。
+#   建议：验证时临时设为 true，验证完改回 false。
+gitlab_webhook_test_on_apply = false
+
+# ★ destroy 时是否删除 GitLab webhook，默认 false（理由同 cicd_cleanup_on_destroy）
+gitlab_cleanup_on_destroy = false

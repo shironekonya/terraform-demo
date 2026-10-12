@@ -1,0 +1,8 @@
+---
+# baseline 依赖 guard：保护机制必须先于任何动作跑起来。
+# 而且 guard 是 filter_plugins 的宿主（wf_under_any 过滤器），
+# 所以这条依赖也是 baseline 能正常渲染的前提。
+#
+# 同一次 play 里重复的 role 会被 Ansible 去重，所以这里不会让它跑两遍。
+dependencies:
+  - guard

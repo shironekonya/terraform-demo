@@ -1,0 +1,11 @@
+# ---------------------------------------------------------------------------
+# 由 Ansible 管理（roles/baseline），手工修改会在下次运行 playbook 时被覆盖。
+#
+# 想改这些值，请改 roles/baseline/defaults/main.yml 的 wf_limits_settings。
+#
+# 注意：limits 只在**新登录会话**生效。改完要重新登录（或重启服务）才看得到效果，
+#       所以"改完立刻验证"通常会以为没生效。
+# ---------------------------------------------------------------------------
+{% for item in wf_limits_settings %}
+{{ item.domain }} {{ item.limit_type }} {{ item.item }} {{ item.value }}
+{% endfor %}

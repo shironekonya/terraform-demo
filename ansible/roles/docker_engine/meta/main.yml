@@ -1,0 +1,5 @@
+---
+# baseline 已依赖 guard；docker_engine 不依赖 baseline，
+# 但同样需要 guard 先跑（保护状态、过滤器插件都来自它）。
+dependencies:
+  - guard

@@ -1,0 +1,160 @@
+---
+# ===========================================================================
+# audit —— 只读体检（对本地服务器绝对安全）
+#
+# 硬约束：本 role 里的每一个任务都必须是只读的。
+#   命令类任务一律 changed_when: false、failed_when: false
+#   （探测失败要降级成"没探到"，不能中断整场体检）
+#
+# 可验证的性质：跑完本 role，任何被管机器的 changed 都必须是 0。
+#   —— 这正是「本地服务器不覆盖」最直白的验收标准。
+#
+# 报告写在**控制端**（reports/<主机名>.txt），不往被管机器上落任何文件。
+# ===========================================================================
+
+- name: "audit · 采集：工具与运行时版本"
+  ansible.builtin.shell: |
+    for c in python3 docker git curl jq; do
+      if command -v "$c" >/dev/null 2>&1; then
+        printf '%s|%s\n' "$c" "$("$c" --version 2>&1 | head -n1)"
+      else
+        printf '%s|MISSING\n' "$c"
+      fi
+    done
+    if docker compose version >/dev/null 2>&1; then
+      printf 'compose|%s (v2 插件)\n' "$(docker compose version --short 2>&1 | head -n1)"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      printf 'compose|%s (v1 独立二进制)\n' "$(docker-compose --version 2>&1 | head -n1)"
+    else
+      printf 'compose|MISSING\n'
+    fi
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  register: wf_audit_tools
+
+- name: "audit · 采集：监听端口"
+  ansible.builtin.shell: |
+    # 只输出端口号本身，格式处理留在 shell 里做干净，
+    # 这样模板侧只需判断 "端口号在不在列表里"，不用再写正则。
+    if command -v ss >/dev/null 2>&1; then
+      ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | sed 's/.*://' | sort -n -u
+    elif command -v netstat >/dev/null 2>&1; then
+      netstat -lnt 2>/dev/null | awk 'NR>2 {print $4}' | sed 's/.*://' | sort -n -u
+    else
+      echo "__NO_SS__"
+    fi
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  register: wf_audit_listen
+
+- name: "audit · 采集：systemd 服务状态"
+  ansible.builtin.shell: |
+    if ! command -v systemctl >/dev/null 2>&1; then
+      echo "__NO_SYSTEMD__"
+      exit 0
+    fi
+    for s in {{ wf_audit_services | join(' ') }}; do
+      if systemctl list-unit-files "${s}.service" 2>/dev/null | grep -q "^${s}\.service"; then
+        printf '%s|%s|%s\n' "$s" \
+          "$(systemctl is-active "$s" 2>/dev/null || true)" \
+          "$(systemctl is-enabled "$s" 2>/dev/null || true)"
+      fi
+    done
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  register: wf_audit_services_raw
+
+- name: "audit · 采集：容器清单"
+  ansible.builtin.shell: |
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "__NO_DOCKER__"
+      exit 0
+    fi
+    if ! docker info >/dev/null 2>&1; then
+      echo "__NO_DOCKER_PERM__"
+      exit 0
+    fi
+    # 故意用 docker ps 的默认表格输出：不用 --format 模板，
+    # 就不必在 Ansible 里和 Go 模板的双花括号打架（这是本项目踩过的一类坑）。
+    # ★ 这条注释本身就踩过一次：模板引擎不区分注释和正文，只认左双花括号，
+    #   所以 shell 正文里写不出字面的双花括号 —— 连写在注释里也一样会被
+    #   当成表达式解析，报 "Expected an expression, got 'end of print statement'"。
+    docker ps -a
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  register: wf_audit_containers
+
+- name: "audit · 采集：K3s 状态"
+  ansible.builtin.shell: |
+    if ! command -v k3s >/dev/null 2>&1; then
+      echo "__NO_K3S__"
+      exit 0
+    fi
+    k3s --version 2>&1 | head -n1
+    echo "---"
+    if command -v kubectl >/dev/null 2>&1; then
+      kubectl get nodes --no-headers 2>&1 | head -n 20 || true
+    else
+      KUBECONFIG=/etc/rancher/k3s/k3s.yaml k3s kubectl get nodes --no-headers 2>&1 | head -n 20 || true
+    fi
+  args:
+    executable: /bin/sh
+  changed_when: false
+  failed_when: false
+  register: wf_audit_k3s
+
+# ---------------------------------------------------------------------------
+# 关于下面两处 ansible_python_interpreter:
+#
+#   delegate_to: localhost 会把任务交给控制端执行，而控制端需要的解释器是
+#   "跑 ansible-playbook 的那个 Python"（ansible_playbook_python），不是远端
+#   机器上的 /usr/bin/python3。
+#
+#   正常情况下 Ansible 的隐式 localhost 会自动选对；但隐式 localhost 属于
+#   ungrouped 组，会继承 group_vars/all.yml —— 一旦有人在那里按常规习惯写了
+#   ansible_python_interpreter: /usr/bin/python3（对远端是对的，对控制端可能是
+#   错的，比如控制端是 WSL 或 venv），这两步就会以一个"找不到解释器"的诡异
+#   错误挂掉。显式钉住，代价是两行，收益是不受别人改 group_vars 影响。
+# ---------------------------------------------------------------------------
+- name: "audit · 确保报告目录存在（在控制端）"
+  ansible.builtin.file:
+    path: "{{ wf_report_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  changed_when: false
+  run_once: true
+
+# ---------------------------------------------------------------------------
+# 报告在控制端渲染：用 Jinja2 模板而不是再拼一段 shell。
+# 用 lookup('template') 而不是 template 模块，是为了让"在哪台机器上渲染"
+# 毫无歧义 —— 内容用当前主机的 facts 渲染，文件落到控制端。
+# ---------------------------------------------------------------------------
+- name: "audit · 写出体检报告（到控制端 reports/）"
+  ansible.builtin.copy:
+    content: "{{ lookup('template', 'report.txt.j2') }}"
+    dest: "{{ wf_report_dir }}/{{ inventory_hostname }}.txt"
+    mode: "0644"
+  delegate_to: localhost
+  become: false
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  # 写入的是控制端的文件，不是被管机器 —— 所以不让它计入 changed。
+  # 这样「被管机器的 changed 是否全为 0」才是一个干净、可用的验收信号。
+  changed_when: false
+
+- name: "audit · 报告位置"
+  ansible.builtin.debug:
+    msg: "报告已写到控制端: {{ wf_report_dir }}/{{ inventory_hostname }}.txt"
+  run_once: false

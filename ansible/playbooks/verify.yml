@@ -1,0 +1,29 @@
+---
+# ===========================================================================
+# verify.yml —— 纯只读入口
+#
+# 等价于 site.yml 的 A + B 两幕。存在的意义：
+#   "我只想看，不想改" 时不用去记 site.yml 有哪些幕、哪些开关。
+#
+# 可验证的性质：跑完它，任何被管机器的 changed 都必须是 0。
+#   ansible-playbook playbooks/verify.yml
+#   → 结尾应该是 changed=0（报告文件写在控制端，不计入）
+# ===========================================================================
+
+- name: "体检：所有服务器（只读）"
+  hosts: all
+  gather_facts: true
+  vars:
+    intent: read
+  roles:
+    - guard
+    - audit
+
+- name: "基线检测：本地服务器（只读）"
+  hosts: local
+  gather_facts: true
+  vars:
+    intent: read
+  roles:
+    - guard
+    - baseline
