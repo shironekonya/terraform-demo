@@ -75,7 +75,7 @@ def terraform_outputs(module_dir: pathlib.Path, terraform: str) -> dict:
     except FileNotFoundError:
         die(
             f"找不到 {terraform} 命令。\n"
-            "      Ansible 的控制端一般是 Linux/WSL，装法见 terraform-demo/README.md；\n"
+            "      Ansible 的控制端一般是 Linux/WSL，装法见 LOGIC.md 的「环境要求」；\n"
             "      也可以用 --terraform 指定它的绝对路径。"
         )
     except subprocess.TimeoutExpired:
