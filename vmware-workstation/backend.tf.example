@@ -2,8 +2,7 @@
 # 远程后端模板（阿里云 OSS + TableStore 状态锁）
 #
 # ★★ 这个文件默认**不生效**（Terraform 只加载 *.tf / *.tf.json），
-#    仓库开箱即可用本地 state。启用方法见 aliyun-ecs/backend.tf.example 的头部说明，
-#    或者直接看 README 的「分层边界」一节。
+#    仓库开箱即可用本地 state。启用方法见 aliyun-ecs/backend.tf.example 的头部说明。
 #
 # ★ 为什么本地这套（VMware Workstation 虚机）也用 OSS？
 #   因为"state 放哪"和"被管的资源在哪"是两件独立的事。

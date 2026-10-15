@@ -844,7 +844,7 @@ def check_b4(root: pathlib.Path, rep: Report) -> None:
                 "  1. 两个人同时 apply 会互相覆盖 → 产生 state 里没有、"
                 "却真实存在的幽灵资源（永远 destroy 不掉）\n"
                 "  2. state 里有明文凭证（user_data、密钥、密码），散落在各人电脑上\n"
-                "启用方式见 " + ("backend.tf.example" if has_example else "LOGIC.md 的「分层边界」一节")
+                "启用方式见 " + ("backend.tf.example" if has_example else "仓库的远程后端模板")
                 + "：cp backend.tf.example backend.tf → terraform init -migrate-state\n"
                 "单机练手可以忽略；多人协作 / CI 必须配。"
             )
@@ -1478,7 +1478,7 @@ def is_exempt(root: pathlib.Path, path: pathlib.Path) -> bool:
     """这个路径是否落在豁免清单里。
 
     ★ 按**路径段**比较，不做字符串前缀匹配：
-      `foo/bar-OLD` 不是 `foo/bar` 的子路径（这个坑踩过，见 PITFALLS.md 踩坑 22）。
+      `foo/bar-OLD` 不是 `foo/bar` 的子路径（这个坑踩过）。
     """
     relp = rel(root, path).strip("/")
     for prefix in exempt_paths(root):
@@ -1657,8 +1657,8 @@ HOST_VIRT_HINT = (
     "  1. 控制端被钉死在某台装了 Workstation 的机器上 —— 不可复现、上不了 CI\n"
     "  2. 虚机生命周期脱离 state：半接管会留下「state 里没有、却真实存在」的对象\n"
     "  3. 它没有 provider 级的 read 能力，Terraform 接管不了 —— 只有虚假的安全感\n"
-    "如果需要自动化创建虚机，方向是换成有官方 provider 的平台（见 LOGIC.md 的\n"
-    "vSphere 参考写法），或者把「建虚机」留在宿主机上手工做，\n"
+    "如果需要自动化创建虚机，方向是换成有官方 provider 的平台（见仓库里的\n"
+    "vmware-vsphere-reference/ 参考写法），或者把「建虚机」留在宿主机上手工做，\n"
     "仓库只从虚机内部开始接管 —— 这也是本项目现在的做法。"
 )
 

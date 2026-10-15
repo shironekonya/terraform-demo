@@ -26,7 +26,7 @@ wf_audit_services:
 
 # 关键端口。这里同时是「这套环境的事实清单」——
 # 8081 那一项值得注意：Jenkins 容器内是 8080，宿主映射到 8081，
-# 所有外部回调地址都必须写 8081（详见 terraform-demo/README.md）。
+# 所有外部回调地址都必须写 8081。
 wf_audit_ports:
   - port: 22
     what: "SSH"
