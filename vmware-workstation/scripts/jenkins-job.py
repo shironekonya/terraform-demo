@@ -53,7 +53,7 @@ try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except (AttributeError, OSError):
-    pass
+    pass  # 忽略编码错误
 
 
 def die(message: str) -> None:
@@ -159,7 +159,7 @@ def fetch_crumb() -> dict:
 # ===========================================================================
 # 2. 生成任务配置 XML
 # ===========================================================================
-def gen_config_xml() -> str:
+def gen_config_xml() -> str: #自定义生成任务配置 XML 函数
     return f"""<?xml version='1.1' encoding='UTF-8'?>
 <flow-definition plugin="workflow-job">
   <description>Terraform managed deploy pipeline. 实际流水线逻辑见仓库中的 {escape(JENKINSFILE)}</description>
@@ -198,7 +198,7 @@ def job_matches(current_xml: str) -> bool:
     但逐个比对关键字段是可靠的，也比 grep 关键字严格得多。
     """
     try:
-        root = ET.fromstring(current_xml)
+        root = ET.fromstring(current_xml) #Python标准库 XML 解析模块，fromstring 解析 XML 字符串
     except ET.ParseError:
         return False
 
@@ -217,44 +217,49 @@ def job_matches(current_xml: str) -> bool:
 def sync_job(crumb: dict) -> None:
     xml = gen_config_xml().encode("utf-8")
     xml_headers = {"Content-Type": "application/xml", **crumb}
+    job_path = urllib.parse.quote(JOB_NAME, safe="")
 
-    status, _ = request("GET", f"/job/{urllib.parse.quote(JOB_NAME)}/api/json")
+    status, check_body = request("GET", f"/job/{job_path}/api/json")
 
     if status == 200:
         log(f"任务 {JOB_NAME} 已存在，核对配置")
 
-        # 先比对现状，一致就不动（避免无谓地修改任务、产生多余的变更记录）
-        cur_status, current = request(
-            "GET", f"/job/{urllib.parse.quote(JOB_NAME)}/config.xml"
-        )
+        # 先比对现状，一致就不动，避免无谓修改和多余变更记录
+        cur_status, current = request("GET", f"/job/{job_path}/config.xml")
         if cur_status == 200 and job_matches(current):
             log("配置与期望一致，无需改动 ✓")
             return
 
         code, body = request(
             "POST",
-            f"/job/{urllib.parse.quote(JOB_NAME)}/config.xml",
+            f"/job/{job_path}/config.xml",
             data=xml,
             headers=xml_headers,
         )
         if code == 200:
             log("任务配置已更新 ✓")
         else:
-            die(f"更新任务失败，HTTP {code}：{body[:300]}")
-        return
+            log(f"更新任务配置失败: HTTP {code}, body={body!r}")
+            raise RuntimeError(f"更新 Jenkins 任务 {JOB_NAME} 失败: HTTP {code}")
 
-    log(f"任务 {JOB_NAME} 不存在（HTTP {status}），创建中")
-    code, body = request(
-        "POST",
-        f"/createItem?name={urllib.parse.quote(JOB_NAME)}",
-        data=xml,
-        headers=xml_headers,
-    )
-    if code in (200, 201):
-        log("任务创建成功 ✓")
+    elif status == 404:
+        log(f"任务 {JOB_NAME} 不存在，创建任务")
+
+        code, body = request(
+            "POST",
+            f"/createItem?name={job_path}",
+            data=xml,
+            headers=xml_headers,
+        )
+        if code in (200, 201):
+            log("任务创建成功 ✓")
+        else:
+            log(f"创建任务失败: HTTP {code}, body={body!r}")
+            raise RuntimeError(f"创建 Jenkins 任务 {JOB_NAME} 失败: HTTP {code}")
+
     else:
-        die(f"创建任务失败，HTTP {code}：{body[:300]}")
-
+        log(f"查询任务状态失败: HTTP {status}, body={check_body!r}")
+        raise RuntimeError(f"查询 Jenkins 任务 {JOB_NAME} 状态失败: HTTP {status}")
 
 def main() -> None:
     check_auth()
