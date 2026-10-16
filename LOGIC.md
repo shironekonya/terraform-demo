@@ -22,6 +22,7 @@
 
 ### 第二部分 · 操作逻辑：实际怎么跑
 
+- [启动路径：按什么顺序跑](#启动路径按什么顺序跑) — ★ 第一次跑照这条走
 - [阶段一 · 阿里云部分](#阶段一--阿里云部分) — 创建 → 查看 → 销毁
 - [阶段二 · 本地部分：三档递进](#阶段二--本地部分三档递进) — 只读盘点 → 核对 compose → 选择性接管
 - [幂等性与数据安全](#幂等性与数据安全)
@@ -560,8 +561,133 @@ expected_compose = templatefile("${path.module}/templates/jenkins-compose.yaml.t
 
 # 第二部分 · 操作逻辑：实际怎么跑
 
-这一部分是按「你手上的任务」排的：想建云资源走阶段一，想核对本地机器走阶段二，
-想把交付链路接起来走阶段三 / 四，想批量管机器走阶段五。每节都给出可复制的命令和验收判据。
+这一部分是按「手上的任务」组织的：建云资源走阶段一、核对本地机器走阶段二、
+把交付链路接起来走阶段三 / 四、批量管机器走阶段五。每节都给出可复制的命令和验收判据。
+
+## 启动路径：按什么顺序跑
+
+五个阶段是按「手上的任务」分的，第一次把这套东西跑起来时，顺序是下面这条。
+每一步都写明入口、前置、是否改动环境、是否产生费用，以及验收判据；
+完整命令在它对应的阶段一节里，这里只给入口与判据。
+
+| 步骤 | 入口 | 改动什么 | 费用 | 前置 |
+|---|---|---|---|---|
+| 0 · 静态自检 | `tools/check_boundaries.py`、`ansible/tools/` | 无 | 无 | 只需 `python3` |
+| 1 · 工具链与 lock 文件 | `aliyun-ecs/` 的 `terraform init` | 下载 provider 到 `.terraform/` | 无 | Terraform、Git Bash |
+| 2 · 云端创建 → 销毁 | [阶段一](#阶段一--阿里云部分) | 建 VPC / 交换机 / 安全组 / ECS | **按量付费** | 阿里云 AccessKey |
+| 3 · 本地只读盘点（第 1 档） | [阶段二](#阶段二--本地部分三档递进) | 无 | 无 | 两台节点 SSH 可达 |
+| 4 · 本地核对（第 2 档）→ 接管（第 3 档） | [阶段二](#阶段二--本地部分三档递进) | 第 3 档覆写宿主机上的 compose 文件 | 无 | 同上 |
+| 5 · 应用交付链路 | [阶段三](#阶段三--cicd-流水线) | Harbor 项目 + webhook、Jenkins 任务壳 | 无 | Harbor 管理员密码、Jenkins API Token |
+| 6 · GitLab 流水线入口 | [阶段四](#阶段四--gitlab-流水线入口) | GitLab 项目 + webhook | 无 | GitLab API Token |
+| 7 · 批量管理 | [阶段五](#阶段五--ansible批量管理云服务器与本地服务器) | 云机器可变；本地默认一个字节都不改 | 无 | Ansible 控制端（Linux / WSL） |
+
+**最小闭环是 0 → 2 → 3。** 跑通这三步就覆盖了本项目的两个主要结论：
+云上资源能整组创建、也能整组删除；已存在的虚机不会被 Terraform 接管。
+第 4 步之后每一步都会真的改动环境，先确认对自己的环境安全再往下走。
+
+### 第 0 步 · 静态自检（零成本，先跑这个）
+
+不连云、不连机器、不装依赖，只用 Python 标准库：
+
+```bash
+python3 tools/check_boundaries.py             # 九条边界逐条检查 + 复核 boundaries.yml 的衔接登记
+python3 tools/check_boundaries.py --selftest  # 65 个用例，证明检查器确实会响
+```
+
+`ansible/` 那一层还有三个独立检查（依赖 PyYAML —— 装了 Ansible 的机器上一定有）：
+
+```bash
+cd ansible
+python3 tools/check_guard.py             # 静态护栏：没有任何路径能让变更任务碰到本地服务器
+python3 tools/check_guard.py --selftest  # 13 个用例
+python3 tools/selftest.py                # 离线自测：模板渲染 + 保护公式真值表（16 种开关组合）
+```
+
+判据：前两条输出「通过」与「自证通过：65 个用例」，后三条不出现 `✗`。
+
+> CI 里跑的是更严格的一档：`python3 tools/check_boundaries.py --require-remote-state --require-ci`。
+> 它把「已有远程 state」「已声明 CI 入口」也算作必须满足的条件，而这两项在本地首次跑时本来就不满足，
+> 所以本地用默认档、CI 用严格档。这个区别是刻意的：**本地首跑不该被 CI 的门槛挡住。**
+
+### 第 1 步 · 工具链与 lock 文件
+
+工具链要求见 [环境要求](#环境要求)。下面两项最容易卡住，先确认：
+
+```bash
+which bash          # 必须是 Git 安装目录下的 bin/bash.exe；System32 / WindowsApps 下的是 WSL 的
+terraform version   # >= 1.5.0
+```
+
+国内网络下 `terraform init` 拉 provider 会超时，仓库根目录已备好镜像配置：
+
+```bash
+export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"     # 在仓库根目录执行
+```
+
+> `terraform.rc` 与 `terraform.rc.example` 内容相同，但它被 `.gitignore` 排除，
+> 所以每个新环境都要自己设一次。它只让 `aliyun/alicloud` 走阿里云镜像，其余 provider 仍走官方源。
+
+**`.terraform.lock.hcl` 是提交进仓库的**（它固定 provider 的精确版本与哈希）。
+如果它只记了单个平台的哈希，在别的平台上 `init` 会在校验哈希时直接失败：
+
+```
+Error: Failed to install provider
+... doesn't match any of the checksums previously recorded in the dependency lock file
+```
+
+遇到这个报错时，把实际会用到的平台的哈希补全即可（本地是 Windows、CI 是 Linux）：
+
+```bash
+cd aliyun-ecs
+terraform providers lock -platform=windows_amd64 -platform=linux_amd64
+```
+
+跑完这条命令，lock 文件里会同时出现各平台的 `h1:` 与注册表给出的 `zh:` 哈希，
+此后任何平台 `init` 都能过。补全后 `init` 与 `validate` 应分别输出
+`Terraform has been successfully initialized!` 与 `Success! The configuration is valid.`
+
+> `.gitignore` 的注释里已经写明「多平台协作时必须执行一次 `providers lock`」——
+> 出现上面的报错，说明当时没有按它做。
+
+### 第 2 步 · 云端（本项目唯一花钱的一段）
+
+见 [阶段一](#阶段一--阿里云部分)。验收判据三条：
+
+- `terraform output` 打印出 `instance_public_ips`；
+- 访问该公网 IP 能看到 nginx 欢迎页（`user_data` 写入的那行文字），说明实例确实起来了；
+- `apply` 之后 `terraform plan` 显示无变化 —— 否则说明有资源没进 state。
+
+收尾是 `terraform destroy`，之后**再看一眼 `terraform plan`**：它应为空。
+「销毁成功」的输出不等于「没有残留」。
+
+### 第 3、4 步 · 本地部分
+
+见 [阶段二](#阶段二--本地部分三档递进)。第 1 档（默认）只盘点，判据是四份报告全部打印出来，
+且其中的端口、目录、挂载与 `terraform.tfvars` 里的期望值一致。
+
+第 2 档（核对）是推荐的长期状态。第 3 档（接管）会覆写宿主机上的 compose 文件，
+被覆掉的挂载里有 `docker.sock` / `k3s` / `kubectl` / `.kube` 四项，
+少任何一项的症状是「Jenkins 界面一切正常，但所有部署任务失败」。
+
+### 第 5、6 步 · 应用交付与流水线入口
+
+见 [阶段三](#阶段三--cicd-流水线) 与 [阶段四](#阶段四--gitlab-流水线入口)。
+这两步只改 API 层（Harbor 项目 / webhook、GitLab 项目 / webhook），不碰容器与服务本身。
+有三个「配错了不报错、只是没反应」的点：webhook 地址必须写主节点 IP（不能写 `localhost`）、
+端口必须是 8081（Jenkins 的宿主端口，不是容器内的 8080）、
+GitLab 要放行私有网段回调（`gitlab_allow_local_requests`，默认已是 `true`）。
+
+### 第 7 步 · Ansible
+
+见 [阶段五](#阶段五--ansible批量管理云服务器与本地服务器)。控制端必须是 Linux / macOS / WSL；
+仓库放在 `/mnt/c` 下时**必须拷到 Linux 原生文件系统并补一次 `chmod`**，
+否则 `ansible.cfg` 会被静默拒载，`ansible --version | grep "config file"` 会显示 `None`。
+
+判据：`verify.yml` 跑完后任何被管机器的 `changed` 都必须是 0；
+`site.yml` 的默认跑法里，本地变更那一幕（E 幕）应被门闩跳过。
+云机器清单不手写，由 `ansible/tools/gen_cloud_inventory.py` 从 Terraform 的输出生成。
+
+---
 
 ## 阶段一 · 阿里云部分
 
