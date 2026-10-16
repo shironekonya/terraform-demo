@@ -3,10 +3,20 @@
 inventory/hosts.cloud.yml
 
 # ── Ansible 运行期产物 ──
-.cache/          # fact 缓存（jsonfile）
-reports/         # 只读体检报告，写在控制端
+# fact 缓存（jsonfile）。含主机名、用户名、家目录、MAC、machine-id 等机器指纹，绝不入库。
+.cache/
+# 只读体检报告，写在控制端
+reports/*
+# ↑ 例外：这一份是「本地只读保护」的验证证据，随仓库提供（已脱敏）。
+!reports/wsl-verify.txt
+
 *.retry
 
 # ── 跑 tools/ 下的脚本时产生的字节码 ──
 __pycache__/
 *.py[cod]
+
+# ── 注意 ──
+# .gitignore 不支持「行内 # 注释」，# 只能独占一行开头。
+# 写成 `reports/   # 说明` 时整行都会被当成 pattern，规则静默失效 —— 本文件
+# 原先就是这样，导致 .cache/ 的 fact 缓存被当成普通文件提交进仓库。
