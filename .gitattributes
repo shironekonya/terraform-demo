@@ -1,0 +1,4 @@
+# 统一行尾为 LF。原因：.tf 的 local-exec 与 ansible 模板里内嵌 bash 脚本，
+# CRLF 会让 bash 报 `set: pipefail: invalid option name` / `$'\r': command not found`。
+# 没有本文件时，Windows 的 core.autocrlf=true 会在 checkout 时把工作区转成 CRLF。
+* text=auto eol=lf
