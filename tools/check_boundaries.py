@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """分层边界的静态检查：Terraform / Ansible / K8s / 胶水脚本，各管各的。
-
-为什么需要这个脚本：
-    「Terraform 管资源存在性、Ansible 管机器内部状态、K8s 工作负载交给 K8s 工具、
-    胶水脚本不碰 state」—— 这些边界在文档里很容易达成共识，但在**代码里守不住**。
-
-    它们失效的方式全都是渐进式的：某次为了赶进度在 local-exec 里 apt-get install，
-    某次在 ansible 里加一句 terraform apply 兜底，某次把 Deployment 写成了
-    kubernetes_deployment。每一次单独看都「就这一次」，积累起来就是
-    「两个工具抢同一个对象」—— 那种局面下没人说得清当前状态以谁为准。
-
-    所以边界要像保护规则一样做成**可执行检查**：不连机器、不装第三方依赖、纯静态。
+整体逻辑: 
+    1. 检查代码里是否符合边界规则。
+    2. 如果不符合，给出提示。
+    3. 如果符合，给出成功提示。
 
 它校验 9 条边界（每条对应一种真实的越界方式）：
 
@@ -327,6 +320,11 @@ HOST_VIRT_CLI_RE = re.compile(
 
 # 虚拟化平台的 provider 声明与资源类型 —— 只在 .tf 里按**声明位置**匹配。
 # 不裸匹配 "vsphere" 这个词：注释与变量名里出现它都是正常的。
+# 匹配正则规则  【provider 声明】
+#   · 匹配 provider 声明，如 `provider "vsphere" { ... }`
+#   · 匹配资源类型，如 `resource "vmware_vm" "vm-1" { ... }`
+#   · 匹配数据源，如 `data "vmware_vm" "vm-1" { ... }`
+#   · 匹配 source 属性，如 `source = "vmware_vm/123"`
 HOST_VIRT_TF_RE = re.compile(
     r'^\s*provider\s+"(?:vsphere|vmware|vmworkstation)"'
     r'|^\s*(?:resource|data)\s+"(?:vsphere|vmware|vmworkstation)_'
@@ -354,7 +352,7 @@ class Finding:
 
 class Report:
     def __init__(self, root: pathlib.Path, require_remote_state: bool = False,
-                 require_ci: bool = False):
+                 require_ci: bool = False): #绑定类内部属性
         self.root = root
         self.require_remote_state = require_remote_state
         self.require_ci = require_ci
@@ -439,9 +437,6 @@ def is_message_line(code: str) -> bool:
 
 def is_inside_message(code: str, pos: int) -> bool:
     """匹配点左边已经出现了 echo/msg: 之类 —— 说明这段文字是给人看的。
-
-    注意这里**不要求**提示词后面紧跟引号：`echo 安装：sudo apt-get install -y python3`
-    这种不带引号的写法同样常见（真实代码里就有好几处）。
     """
     head = code[:pos]
     return bool(MESSAGE_HEAD_RE.search(head))
@@ -515,10 +510,10 @@ def py_docstring_lines(lines) -> set:
 
 
 def code_lines(path: pathlib.Path, exec_only=False):
-    """yield (lineno_1based, 已剥注释的代码行)。
-
-    - .py：剥行注释、跳过三引号块；exec_only 时只保留执行上下文
-    - .yml / .sh / .tf：剥行注释（.sh 视为"每行都是命令"，不做上下文过滤）
+    """
+    按文件类型（py /yml/yaml /sh/tf）读取文件，去掉注释，跳过空行，逐行 yield (行号 (从 1 开始), 清理后的代码文本)；
+    开启 exec_only=True 时，只保留 “可执行逻辑行”，跳过注释 / 文档字符串 / 非执行的声明行。
+    这是典型生成器函数（里面有yield），不会一次性返回全部列表，一行一行惰性产出，适合扫描大文件。
     """
     text = read_text(path)
     lines = text.splitlines()
@@ -534,7 +529,7 @@ def code_lines(path: pathlib.Path, exec_only=False):
                 continue
             code = strip_hash_comment(raw)
             if code.strip():
-                yield i + 1, code
+                yield i + 1, code # 生成器表达式，返回 (lineno_1based, 已剥注释的代码行)
         return
 
     if suffix in (".yml", ".yaml") and exec_only:
@@ -590,21 +585,26 @@ def collect(root: pathlib.Path, suffixes):
 # ===========================================================================
 # B1 · Terraform / 胶水脚本不得触发 Ansible
 # ===========================================================================
-
+"""
+业务逻辑：ANSIBLE_INVOKE_RE和ansible_call_files函数，
+ansible_call_files函数根据文件类型筛选出需要检查的文件，
+ANSIBLE_INVOKE_RE则用于匹配文件中的 Ansible 调用命令。
+"""
 ANSIBLE_INVOKE_RE = re.compile(
     r"\bansible-(?:playbook|galaxy|vault|pull|doc|console|inventory|config|lint)\b"
     r"|\bansible\s+(?:-|--|all\b)"
-)
+) # 匹配 Ansible 调用命令，包括所有变体
 
 
 def ansible_call_files(root: pathlib.Path) -> list[pathlib.Path]:
+    # 代码逻辑：不同文件根据类型筛选出需要检查的文件
     """B1/B8 要扫的文件：Terraform 配置 + 胶水脚本。
 
     ★ 刻意**不包括** CI 流水线文件。流水线是编排者，它同时调用 Terraform 和
       Ansible 是本职；要禁的是「Terraform 或胶水脚本顺手触发 Ansible」。
       （流水线那边由 B7 单独检查：不许把两者串进同一个 job。）
     """
-    out: list[pathlib.Path] = []
+    out: list[pathlib.Path] = [] #内部
     out += collect(root, {".tf"})
     out += [p for p in collect(root, {".py", ".sh"})
             if "ansible" not in p.relative_to(root).parts[:1]]
@@ -620,14 +620,11 @@ def ansible_call_files(root: pathlib.Path) -> list[pathlib.Path]:
 
 
 def iter_ansible_calls(root: pathlib.Path):
-    """yield (path, lineno, code)：Terraform / 胶水脚本对 Ansible 的每一次调用。
-
-    B1 与 B8 共用这一份遍历逻辑。共用是刻意的：两条规则各写一份的话，
-    某天有人改了过滤条件，就会出现「B1 说它越界、B8 说没这回事」
-    这种自相矛盾的输出 —— 那比只写一条规则还糟。
+    """yield 迭代器，返回所有需要检查的文件中，对 Ansible 的每一次调用。
+    用于 B1 规则和 B8 规则。
     """
     for path in ansible_call_files(root):
-        exec_only = path.suffix.lower() == ".py"
+        exec_only = path.suffix.lower() == ".py" or path.suffix.lower() == ".sh" # 只检查 Python 或 Shell 脚本
         for lineno, raw in code_lines(path, exec_only=exec_only):
             code = normalize_argv(raw)
             m = ANSIBLE_INVOKE_RE.search(code)
@@ -678,14 +675,14 @@ def terraform_call_files(root: pathlib.Path) -> list[pathlib.Path]:
 
 
 def iter_terraform_calls(root: pathlib.Path):
-    """yield (path, lineno, code, 子命令, 下一级词)：Ansible 侧对 terraform 的每一次调用。
-
-    B2 用它判断「这次调用越不越界」，B8 用它判断「这次调用登记了没有」。
-    和 iter_ansible_calls 一样，共用一份遍历逻辑是为了两条规则口径一致。
+    """yield 迭代器，返回所有需要检查的文件中，对 terraform 的每一次调用。
+    用于 B2 规则和 B8 规则。
     """
     for path in terraform_call_files(root):
-        suffix = path.suffix.lower()
-        for lineno, raw in code_lines(path, exec_only=(suffix != ".sh")):
+        # .sh 每行都是命令，不做上下文过滤；.py 必须开 exec_only ——
+        # 关掉之后文档字符串里出现的 `terraform output` 会被当成真实调用，B2 直接误报。
+        exec_only = path.suffix.lower() != ".sh"
+        for lineno, raw in code_lines(path, exec_only=exec_only):
             code = normalize_argv(raw)
             if "terraform" not in code:
                 continue
@@ -794,6 +791,7 @@ def _backend_blocks(path: pathlib.Path):
 
 
 def terraform_modules(root: pathlib.Path) -> list[pathlib.Path]:
+    # 找到所有需要检查的文件中，对 terraform 的每一次调用。
     """在用 Terraform 模块目录。
 
     ★ 子模块排除：Terraform 明确禁止子模块配置 backend（state 归父模块管），
@@ -809,9 +807,10 @@ def terraform_modules(root: pathlib.Path) -> list[pathlib.Path]:
     for path in collect(root, {".tf"}):
         for m in re.finditer(r'source\s*=\s*"((?:\.\.?/)[^"]+)"', read_text(path)):
             src = m.group(1)
-            child_sources.add((path.parent / src).resolve())
+            child_sources.add((path.parent / src).resolve()) #解析path.parent / src为绝对路径，添加到child_sources中
 
-    for d in sorted(root.iterdir()):
+    for d in sorted(root.iterdir()): 
+        # 遍历root目录下的所有子目录
         if not d.is_dir() or d.name in SKIP_DIR_NAMES:
             continue
         if not any(d.glob("*.tf")):
@@ -917,6 +916,7 @@ TFSTATE_RE = re.compile(r"\btfstate\b")
 
 
 def check_b5(root: pathlib.Path, rep: Report) -> None:
+    # 找到所有需要检查的文件中，对 terraform 的每一次调用。
     targets = collect(root, {".py", ".sh"})
     targets += collect(root, {".tf"})
 
@@ -1008,6 +1008,8 @@ def find_ci_files(root: pathlib.Path) -> list[pathlib.Path]:
         path = root / name
         if path.is_file():
             found.append(path)
+    # GitHub Actions 的流水线目录：多一层 ".gitlab" 就永远不存在，
+    # 结果是 B7 静默跳过全部 GitHub 流水线 —— 护栏看起来在跑，其实没扫。
     wf_dir = root / ".github" / "workflows"
     if wf_dir.is_dir():
         for path in sorted(wf_dir.iterdir()):
@@ -1068,6 +1070,8 @@ def split_jobs(text: str) -> list[tuple[str, list[str]]]:
 
 
 def check_bypass_scripts(root: pathlib.Path, rep: Report) -> None:
+    # 找到所有需要检查的文件中，对 terraform 的每一次调用，
+    # 都要检查一下是否是「一个人就能改环境」的入口脚本。
     """找「一个人就能改环境」的入口脚本。
 
     这条只能提示，不能判失败 —— 项目早期本来就得有人在本地跑。
@@ -1075,6 +1079,7 @@ def check_bypass_scripts(root: pathlib.Path, rep: Report) -> None:
     只要有一个 deploy.sh，流水线就随时可以被绕过，而且没人会知道。
     """
     for path in sorted(root.rglob("*")):
+        #迭代所有文件
         if not path.is_file():
             continue
         if any(part in SKIP_DIR_NAMES for part in path.parts):
@@ -1091,6 +1096,14 @@ def check_bypass_scripts(root: pathlib.Path, rep: Report) -> None:
             continue
 
         for lineno, raw in code_lines(path, exec_only=(suffix == ".py")):
+            # 代码逻辑  
+            # 过滤掉空行、注释、环境变量赋值等
+            if not raw.strip():
+                continue
+            if raw.startswith("#"):
+                continue
+            if raw.startswith("export"):
+                continue
             code = normalize_argv(raw)
             m = TF_MUTATION_RE.search(code) or ANSIBLE_PLAYBOOK_RE.search(code)
             if not m:
@@ -1139,6 +1152,7 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
         where = rel(root, path)
 
         for job_name, body in split_jobs(read_text(path)):
+            # 过滤掉空 job
             executed = [ln for ln in body if ln.strip()]
             if not executed:
                 continue
@@ -1148,7 +1162,7 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
             has_tf_mutation = bool(TF_MUTATION_RE.search(joined))
             has_ansible = bool(ANSIBLE_PLAYBOOK_RE.search(joined))
             has_manual = any(MANUAL_RE.match(ln) for ln in executed)
-
+            # 记录是否有变更类动作
             if has_tf_mutation:
                 saw_tf_mutation = True
             if has_ansible:
@@ -1186,6 +1200,7 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                 )
 
             # ---- ③ 全量入口必须显式限定范围 -----------------------------
+            #limit是原始的 ansible-playbook 调用，没有 --limit 选项代表全量入口
             for line in executed:
                 if not SITE_PLAYBOOK_RE.search(line):
                     continue
@@ -1202,6 +1217,9 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                     )
                     continue
 
+                # 走到这里 "--limit" 一定存在（上一段已拦掉没有 --limit 的情况），
+                # 所以可以无条件切分。加 "cloud" 前置判断会让 --limit local 走到
+                # 未赋值分支，直接 UnboundLocalError —— 整个自证用例都跑不下去。
                 limit_part = line.split("--limit", 1)[1]
                 if "local" not in limit_part:
                     continue
@@ -1228,6 +1246,7 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                 )
 
     # ---- ⑤ 流水线只覆盖了一半 ------------------------------------------
+    # 接手：流水线只覆盖了一半，说明有变更类动作，但没有 ansible-playbook 调用
     if saw_tf_mutation and not saw_ansible:
         rep.warn(
             "B7", "（流水线）",
@@ -1259,12 +1278,7 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
 # ===========================================================================
 
 class _ParseError:
-    """解析失败的占位符。
-
-    它存在的唯一理由：把「这个字段写错了」和「这个字段压根没写」区分开。
-    否则一句 `why: "少了右引号` 会被报两次（引号错 + 没写 why），
-    报两次的后果是第二次看起来像另一个问题，反而不好修。
-    """
+    """解析失败的占位符。"""
 
     def __repr__(self) -> str:
         return "<解析失败>"
@@ -1488,6 +1502,7 @@ def is_exempt(root: pathlib.Path, path: pathlib.Path) -> bool:
 
 
 def check_b8(root: pathlib.Path, rep: Report) -> None:
+    # 检查 handoffs 清单
     handoff_path = root / HANDOFF_FILE
     declarations: dict[tuple[str, str, str], dict] = {}
 
@@ -1530,6 +1545,7 @@ def check_b8(root: pathlib.Path, rep: Report) -> None:
                 continue
 
             unknown = set(entry) - HANDOFF_ALLOWED_KEYS - {"__line__"}
+            #把 entry 里面的键，减去允许的合法键、再去掉 __line__，剩下的就是不认识 / 不允许的非法键，放到 unknown 集合里
             if unknown:
                 rep.warn(
                     "B8", loc,
@@ -1560,19 +1576,7 @@ def check_b8(root: pathlib.Path, rep: Report) -> None:
             if src == dst:
                 rep.fail("B8", loc, f"from 和 to 相同（{src}）—— 这不是跨层衔接")
                 continue
-
-            # ★ 允许声明的衔接只有一种形状：某一层**只读地**读 Terraform 的输出。
-            #
-            #   为什么把 to 钉死成 terraform，而不是「任何只读方向都行」：
-            #
-            #   反方向（任何人读 Ansible / 让 Ansible 被别人调用）会绕开 B1 ——
-            #   而用声明去解决 B1，是把安全阀当开关用。B1 禁止 Terraform 触发
-            #   Ansible，是因为那会让 apply 的结果不再等于这次变更的结果；
-            #   这个性质不是「这次特殊」就能绕过的。
-            #
-            #   顺带一个好处：把 to 钉死之后，「单向」这条性质就是**结构性**的，
-            #   环根本构造不出来，也就不需要再写一个成环检测。
-            #   （一个永远不会响的检查比没有检查更糟：它让人以为查过了。）
+            #只允许一种合法衔接：别的层只读 Terraform 的输出；其余全部拦截报错，同时防止重复声明同一条衔接关系。判断dst是否是terraform的输出
             if dst != "terraform":
                 rep.fail(
                     "B8", loc,
@@ -1688,6 +1692,7 @@ def check_exemptions(root: pathlib.Path, rep: Report) -> None:
 
     seen: set[str] = set()
     for entry in entries:
+        # 检查每个豁免项是否符合要求
         loc = f"{HANDOFF_FILE}:{entry.get('__line__', 0)}"
 
         missing = EXEMPT_REQUIRED_KEYS - set(entry)
@@ -1741,10 +1746,14 @@ def check_exemptions(root: pathlib.Path, rep: Report) -> None:
 
 
 def check_b9(root: pathlib.Path, rep: Report) -> None:
+    """检查代码是否符合 B9 规则。总体逻辑：
+    1. 检查豁免清单是否符合要求。
+    2. 检查代码是否符合 B9 规则。
+"""
     check_exemptions(root, rep)
 
     def _is_prose(code: str, pos: int) -> bool:
-        """这行是给人看的文字吗？注释已在 code_lines 里剥掉，
+        """判断文字是否人类可读，
         这里拦的是 error_message / echo / msg 这类提示文本。"""
         return is_message_line(code) or is_inside_message(code, pos)
 
