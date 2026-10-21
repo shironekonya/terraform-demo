@@ -19,7 +19,7 @@ variable "k3s_server" {
   })
   default = {
     name    = "k3s-server"
-    host    = "192.168.1.101"
+    host    = "192.168.193.147"
     user    = "ubuntu"
     ssh_key = "~/.ssh/id_ed25519"
   }
@@ -35,7 +35,7 @@ variable "k3s_agent" {
   })
   default = {
     name    = "k3s-agent"
-    host    = "192.168.1.102"
+    host    = "192.168.193.139"
     user    = "ubuntu"
     ssh_key = "~/.ssh/id_ed25519"
   }
@@ -423,7 +423,7 @@ variable "webhook_endpoint_url" {
     根本到不了 Jenkins。必须用宿主机 IP 才能出容器。
 
     典型值：
-      http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=<你的token>
+      http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=<你的token>
       （注意端口是 8081，对应宿主机的映射端口；写成 8080 会打到空端口）
     （需要 Jenkins 安装 Generic Webhook Trigger 插件）
   EOT
@@ -647,7 +647,7 @@ variable "gitlab_webhook_endpoint_url" {
     GitLab 收到 push 后去调用的 URL，即 Jenkins 的构建触发地址。
 
     典型值：
-      http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=<构建任务的token>
+      http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=<构建任务的token>
 
     ★ 端口必须是 **8081**（Jenkins 宿主端口），不是 8080。
       写 8080 的失效方式极其隐蔽：GitLab 把这次投递记为失败，
@@ -672,7 +672,7 @@ variable "gitlab_webhook_endpoint_url" {
       原因一：GitLab 和 Jenkins 不在同一台机器上，写 localhost 会指向 GitLab 自己。
       原因二：脚本要从这个地址里解析出 host:port 加入 GitLab 的出站放行白名单，
              没有协议前缀就解析不出来。
-      正确示例：http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=xxx
+      正确示例：http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=xxx
     EOT
   }
 }

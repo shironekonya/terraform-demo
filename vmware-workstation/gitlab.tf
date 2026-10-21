@@ -48,7 +48,7 @@ locals {
   gl_project_slug = reverse(split("/", local.gl_project_path))[0]
 
   # ---------------------------------------------------------------------------
-  # 要加进 GitLab 出站放行白名单的条目，形如 192.168.1.101:8080
+  # 要加进 GitLab 出站放行白名单的条目，形如 192.168.193.147:8080
   # 从 webhook 地址里取 host:port 部分（变量已校验带 http(s):// 前缀）
   # ---------------------------------------------------------------------------
   gl_lan_entry = var.gitlab_webhook_endpoint_url != "" ? regex("^https?://([^/]+)", var.gitlab_webhook_endpoint_url)[0] : ""

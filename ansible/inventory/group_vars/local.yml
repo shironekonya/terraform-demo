@@ -27,7 +27,7 @@
 
 # 本地机器是 ubuntu 用户登录，读特权目录 / 装包需要 sudo
 # ★ 前置条件：该用户必须能**免密 sudo**，否则 become 会卡在密码提示。
-#   验证：ssh ubuntu@192.168.1.101 'sudo -n true && echo OK'
+#   验证：ssh ubuntu@192.168.193.147 'sudo -n true && echo OK'
 ansible_user: ubuntu
 ansible_become: true
 ansible_become_method: sudo

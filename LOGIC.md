@@ -137,14 +137,14 @@ terraform-demo/
 
 ```
 ┌─────────────────────────────────────────────────┐
-│  K3s 主节点（server）  192.168.1.101              │
+│  K3s 主节点（server）  192.168.193.147            │
 │  • K3s 控制平面                                  │
 │  • Jenkins  ← docker-compose 栈（宿主 8081）      │
 │  • Harbor   ← docker-compose 栈（默认配置 ~9 容器，宿主 80/443）│
 └─────────────────────────────────────────────────┘
                     │
 ┌─────────────────────────────────────────────────┐
-│  K3s 从节点（agent）   192.168.1.102              │
+│  K3s 从节点（agent）   192.168.193.139            │
 │  • K3s 工作负载                                  │
 │  • GitLab   ← Omnibus 实体服务（系统包安装，非容器）│
 └─────────────────────────────────────────────────┘
@@ -980,9 +980,9 @@ Harbor 的 webhook 支持这些事件类型：
 所以 `webhook_endpoint_url` **必须写主节点的 IP**：
 
 ```
-✅ http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=xxx
+✅ http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=xxx
 ❌ http://localhost:8081/generic-webhook-trigger/invoke?token=xxx    ← localhost 指向 Harbor 自己
-❌ http://192.168.1.101:8080/generic-webhook-trigger/invoke?token=xxx ← 端口错，Jenkins 在 8081
+❌ http://192.168.193.147:8080/generic-webhook-trigger/invoke?token=xxx ← 端口错，Jenkins 在 8081
 ```
 
 相对地，Terraform **调 API 时**用的是 `localhost`（脚本在主节点上执行，端口映射到宿主机）。两个场景方向相反，很容易搞混 —— 这也是变量注释里反复强调的原因。
@@ -1009,7 +1009,7 @@ terraform apply     # 输出 cicd_pipeline 会打印链路构成 + 三项安全�
 ```hcl
 harbor_admin_password  = "你的 Harbor 管理员密码"
 jenkins_api_token      = "在 Jenkins 用户配置里生成的 API Token"   # 不是登录密码
-webhook_endpoint_url   = "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=xxx"
+webhook_endpoint_url   = "http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=xxx"
 #                        ★ 端口是 8081（Jenkins 宿主端口），不是 8080
 
 harbor_project         = "apps"
@@ -1119,7 +1119,7 @@ manage_gitlab_cicd = false   # 管项目和 Push webhook（API 层）
 # terraform.tfvars
 manage_gitlab_cicd = true
 gitlab_api_token   = "..."                    # 需要 api scope + 管理员权限
-gitlab_webhook_endpoint_url = "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=..."
+gitlab_webhook_endpoint_url = "http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=..."
 ```
 
 为什么先做这一步：入口的问题最隐蔽。先把「push 能触发 Jenkins」这件事确认下来，排查范围最小。
@@ -1485,23 +1485,23 @@ ansible --version | grep "config file"
 
 ```bash
 # 1. 能免密登录（Terraform 无法处理交互式密码输入）
-ssh -i ~/.ssh/id_ed25519 ubuntu@192.168.1.101     # 主节点
-ssh -i ~/.ssh/id_ed25519 ubuntu@192.168.1.102     # 从节点（GitLab 在这台）
+ssh -i ~/.ssh/id_ed25519 ubuntu@192.168.193.147     # 主节点
+ssh -i ~/.ssh/id_ed25519 ubuntu@192.168.193.139     # 从节点（GitLab 在这台）
 
 # 2. 主节点：目标用户能执行 docker，无需 sudo
-ssh ubuntu@192.168.1.101 'docker ps'
+ssh ubuntu@192.168.193.147 'docker ps'
 # 若报 permission denied，把用户加入 docker 组：
 #   sudo usermod -aG docker $USER && newgrp docker
 
 # 3. 从节点：能读到 GitLab 服务状态（盘点要用）
-ssh ubuntu@192.168.1.102 'sudo gitlab-ctl status'
+ssh ubuntu@192.168.193.139 'sudo gitlab-ctl status'
 
 # 4. 从节点上 GitLab 的 API 要能被本机访问（用于项目与 webhook 管理）
-curl -s http://192.168.1.102/api/v4/version
+curl -s http://192.168.193.139/api/v4/version
 
 # 5. 两台都要有 python3（核对脚本是 Python 写的，跑在远端）
-ssh ubuntu@192.168.1.101 'python3 -V'
-ssh ubuntu@192.168.1.102 'python3 -V'
+ssh ubuntu@192.168.193.147 'python3 -V'
+ssh ubuntu@192.168.193.139 'python3 -V'
 ```
 
 代码里用了 `BatchMode=yes`（禁止交互），所以免密登录是硬要求。如果卡在密码提示，说明密钥没配好。

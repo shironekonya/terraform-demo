@@ -27,10 +27,10 @@ GitLab 项目 + Push Webhook 同步（在 K3s 从节点上执行）
 ---------------------------------------------------------------------------
 本地调试
 
-    WF_CONFIG_JSON='{"gitlab_url":"http://192.168.1.102","token":"...",
+    WF_CONFIG_JSON='{"gitlab_url":"http://192.168.193.139","token":"...",
       "project_name":"demo-app","project_path":"demo-app",
-      "hook_url":"http://192.168.1.101:8081/x?token=y",
-      "lan_entry":"192.168.1.101:8081","allow_local":true,"do_test":false,
+      "hook_url":"http://192.168.193.147:8081/x?token=y",
+      "lan_entry":"192.168.193.147:8081","allow_local":true,"do_test":false,
       "project_payload":{"name":"demo-app","path":"demo-app","visibility":"private"},
       "hook_payload":{"url":"...","push_events":true}}' \
       python3 scripts/gitlab-project.py

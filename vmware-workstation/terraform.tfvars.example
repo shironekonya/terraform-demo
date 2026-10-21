@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 k3s_server = {
   name    = "k3s-server"
-  host    = "192.168.1.101"          # ← 改成你主节点的实际 IP
+  host    = "192.168.193.147"          # ← 改成你主节点的实际 IP
   user    = "ubuntu"                 # ← 改成你的登录用户
   ssh_key = "~/.ssh/id_ed25519"      # ← 改成你的私钥路径
 }
@@ -20,7 +20,7 @@ k3s_server = {
 # ---------------------------------------------------------------------------
 k3s_agent = {
   name    = "k3s-agent"
-  host    = "192.168.1.102"          # ← 改成你从节点的实际 IP
+  host    = "192.168.193.139"          # ← 改成你从节点的实际 IP
   user    = "ubuntu"
   ssh_key = "~/.ssh/id_ed25519"
 }
@@ -121,7 +121,7 @@ harbor_webhook_name = "jenkins-deploy-trigger"
 #    因为 Harbor 跑在容器里，容器内的 localhost 是它自己，到不了 Jenkins。
 #    需要 Jenkins 安装 Generic Webhook Trigger 插件。
 webhook_endpoint_url = ""
-#    例: "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=你的token"
+#    例: "http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=你的token"
 #        ★ 端口是 8081。写错端口时的现象是「流水线毫无反应」，两边都不报错 ——
 #          apply 输出的安全检查段落会帮你核对端口是否一致。
 
@@ -190,7 +190,7 @@ gitlab_project_visibility = "private"
 #    代码里已加校验，填 localhost / 127.0.0.1 会直接报错。
 #    需要 Jenkins 安装 Generic Webhook Trigger 插件。
 gitlab_webhook_endpoint_url = ""
-#    例: "http://192.168.1.101:8081/generic-webhook-trigger/invoke?token=构建任务的token"
+#    例: "http://192.168.193.147:8081/generic-webhook-trigger/invoke?token=构建任务的token"
 #        ★ 端口是 8081（Jenkins 宿主端口），不是 8080。
 
 # webhook secret token：GitLab 会在 X-Gitlab-Token 头里原样带上，供 Jenkins 校验来源。

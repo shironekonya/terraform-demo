@@ -32,7 +32,7 @@ Python 直接用 json 模块，语义是明确的：
 
     WF_CONFIG_JSON='{"api":"http://localhost","project":"apps","user":"admin",
       "password":"...","webhook_name":"jenkins-deploy-trigger",
-      "endpoint":"http://192.168.1.101:8081/x?token=y","auth_header":"",
+      "endpoint":"http://192.168.193.147:8081/x?token=y","auth_header":"",
       "event_types":["PUSH_ARTIFACT"]}' python3 scripts/harbor-webhook.py
 """
 

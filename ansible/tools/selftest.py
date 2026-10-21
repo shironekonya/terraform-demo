@@ -148,7 +148,7 @@ def make_env(strict: bool = False):
 def facts_local() -> dict:
     return {
         "inventory_hostname": "k3s-server",
-        "ansible_host": "192.168.1.101",
+        "ansible_host": "192.168.193.147",
         "wf_note": "K3s 控制平面 + Jenkins(compose) + Harbor(compose)",
         "wf_in_local_group": True,
         "wf_protected": True,
