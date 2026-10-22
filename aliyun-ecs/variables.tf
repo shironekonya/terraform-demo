@@ -45,10 +45,21 @@ variable "instance_type" {
   default     = "ecs.e-c1m1.large"
 }
 
-variable "image_id" {
-  description = "镜像 ID，需与 region 匹配。默认 Alibaba Cloud Linux 3"
+variable "image_os" {
+  description = "镜像的发行版族。留空 image_id 时按它查当前地域的最新构建。ubuntu_24_04 的系统 python 是 3.12，现代 ansible 可直接管理；alibaba_cloud_linux_3 的系统 python 是 3.6，只能用 ansible-core <= 2.16"
   type        = string
-  default     = "aliyun_3_x64_20G_alibase_20240819.vhd"
+  default     = "ubuntu_24_04"
+
+  validation {
+    condition     = contains(["ubuntu_24_04", "alibaba_cloud_linux_3"], var.image_os)
+    error_message = "image_os 只支持 ubuntu_24_04（默认）与 alibaba_cloud_linux_3。"
+  }
+}
+
+variable "image_id" {
+  description = "镜像 ID。非空则直接使用（钉死某一版镜像用这个）；留空则按 image_os 查询当前地域最新构建"
+  type        = string
+  default     = ""
 }
 
 variable "system_disk_category" {
@@ -67,6 +78,17 @@ variable "internet_max_bandwidth_out" {
   description = "公网出带宽 Mbps。0 表示不分配公网 IP"
   type        = number
   default     = 5
+}
+
+variable "app_stack_port" {
+  description = "Ansible 的 app_stack role 对外暴露的端口，安全组要放开它。刻意与 80 错开 —— user_data 已经在 80 上起了系统 nginx"
+  type        = number
+  default     = 8080
+
+  validation {
+    condition     = var.app_stack_port >= 1 && var.app_stack_port <= 65535
+    error_message = "app_stack_port 需是 1~65535 之间的端口号。"
+  }
 }
 
 variable "ssh_public_key" {

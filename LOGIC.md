@@ -736,9 +736,15 @@ terraform destroy
 ### 几个值得留意的写法
 
 - **`for_each` 而非 `count`** 管理实例。用 `count` 时，删掉中间一台会导致后面所有实例重建；`for_each` 只动目标那一台。
-- **`user_data_replace_on_change = false`**，避免改个描述就触发实例重启。
+- **镜像不写死 ID**：`image_id` 留空时按 `image_os`（默认 `ubuntu_24_04`）用 `data "alicloud_images"`
+  查当前地域的最新构建；想钉死版本就把 `image_id_used` 的值填回 `image_id`。
+  默认选 Ubuntu 而不是 Alibaba Cloud Linux 3，是因为后者的系统 python 是 3.6，
+  ansible-core 2.17+ 无法管理它（`SyntaxError: future feature annotations is not defined`）——
+  取舍与另一条路（钉 ansible 2.16 + ALinux3）都写在 `ansible/requirements.txt` 与 `aliyun-ecs/image.tf` 的注释里。
+- **`ignore_changes = [user_data]`**，只有启动脚本不触发重建；改脚本不会重建机器（重建会换公网 IP），
+  要生效得 `-replace`。**`image_id` 不忽略** —— 换镜像是换操作系统，必须重建，不能被静默保留。
 - **`instance_charge_type = "PostPaid"`**（按量付费）+ `deletion_protection = false`，学习场景用完一把清干净。
-- **`ignore_changes = [image_id]`**，镜像 ID 变更不直接重建，先让人看到 plan 再决定。
+- `user_data` 按**包管理器**分支（apt / dnf / yum），而不是按发行版名字判断 —— 支持换镜像也不改脚本。
 - 变量的 `validation` 块限制了实例数量上限，防止手滑开出几十台。
 
 ### 安全提醒

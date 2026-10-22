@@ -8,6 +8,11 @@ output "zone_id" {
   value       = local.zone_id
 }
 
+output "image_id_used" {
+  description = "本次实际使用的镜像 ID。想固定镜像（避免新版构建发布后 plan 显示重建）就把它填进 terraform.tfvars 的 image_id"
+  value       = local.resolved_image_id
+}
+
 output "vpc_id" {
   description = "VPC ID"
   value       = alicloud_vpc.main.id

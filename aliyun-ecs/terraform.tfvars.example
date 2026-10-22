@@ -10,6 +10,13 @@ zone_id      = "" # 留空自动选择
 instance_count = 1
 instance_type  = "ecs.e-c1m1.large"
 
+# 镜像：留空 image_id 时按 image_os 查当前地域最新构建
+#   ubuntu_24_04           系统 python 3.12，现代 ansible 可直接管理（默认）
+#   alibaba_cloud_linux_3  系统 python 3.6，只能用 ansible-core <= 2.16
+# 想钉死某一版镜像：先 apply 一次，把 `terraform output image_id_used` 的值填到 image_id
+image_os = "ubuntu_24_04"
+image_id = ""
+
 # 公网出带宽，0 则不开公网 IP（更省钱，可走 EIP 或跳板机）
 internet_max_bandwidth_out = 5
 
