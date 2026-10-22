@@ -1370,7 +1370,9 @@ python3 tools/selftest.py               # 离线自测：模板渲染 + 保护�
 
 ```bash
 # 0) 控制端准备（Linux / macOS / WSL 原生文件系统）
-python3 -m venv ~/.venvs/ansible && ~/.venvs/ansible/bin/pip install ansible
+#    版本用 requirements.txt 里的约束，别直接 pip install ansible —— 
+#    为什么钉版本写在 ansible/requirements.txt 的注释里（ALinux3 的 python 是 3.6）
+python3 -m venv ~/.venvs/ansible && ~/.venvs/ansible/bin/pip install -r ansible/requirements.txt
 
 # 1) 只读验收：跑完它，任何被管机器的 changed 都必须是 0
 ~/.venvs/ansible/bin/ansible-playbook playbooks/verify.yml
@@ -1416,7 +1418,7 @@ Ansible 用 `os.fork` 拉起 worker 进程，Windows 没有这个函数。这和
 
 | 做法 | 说明 |
 |---|---|
-| WSL2（推荐） | `wsl --install` 后在 WSL 里 `pip install ansible`。★ 仓库最好拷到 WSL 原生文件系统（如 `~/`）再跑，原因见下 |
+| WSL2（推荐） | `wsl --install` 后在 WSL 里 `pip install -r ansible/requirements.txt`（版本约束的必要性见该文件注释）。★ 仓库最好拷到 WSL 原生文件系统（如 `~/`）再跑，原因见下 |
 | Linux / macOS 机器 | 直接作为控制端；注意它对两台本地机器要有 SSH 直连 |
 | 容器 | `docker run -it --rm -v "$PWD:/work" -w /work alpine/ansible ansible-playbook ...` |
 

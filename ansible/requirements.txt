@@ -1,0 +1,40 @@
+# 控制端依赖
+#
+#   python3 -m venv ~/.venvs/ansible
+#   ~/.venvs/ansible/bin/pip install -r requirements.txt
+#
+# ---------------------------------------------------------------------------
+# 为什么钉在 2.16.x，而不是装最新版
+#
+# 目标是 Alibaba Cloud Linux 3，它的 /usr/bin/python3 是 3.6，
+# 而且不能升级 —— dnf 自身的脚本就挂在 /usr/bin/python3 上
+# （阿里云文档明确写了不要替换这个解释器）。
+#
+# ansible-core 对目标节点 Python 的要求：
+#   2.16  → 2.7 / 3.6 ~ 3.12
+#   2.17  → 3.7 ~ 3.12     （丢掉 3.6）
+#   2.18+ → 3.8 ~ 3.13     （丢掉 3.7）
+#
+# 装最新版（2.18/2.19）去连 ALinux3，会在 gather_facts 第一步就失败：
+#
+#   ansible.legacy.setup: Module result deserialization failed:
+#   No start of json char found
+#   module_stderr: File "<stdin>", line 3
+#                 SyntaxError: future feature annotations is not defined
+#
+# 那一行是 2.17+ 模块载荷里的 `from __future__ import annotations`，
+# 3.6 不认识。注意它失败在 setup 而不是某个具体任务上，所以表现为
+# "连上了、但一个 fact 都拿不到"，容易被误判成网络或 SSH 问题。
+#
+# ---------------------------------------------------------------------------
+# 想用新版 ansible 的话，必须先让目标机的 Python 到 3.8 以上，两条路：
+#
+#   ① 换镜像：Ubuntu 22.04+ / Alibaba Cloud Linux 4（自带较新的 system python）
+#   ② 目标机装高版本 python 并显式指定解释器：
+#        dnf install -y python3.11          # ALinux3 官方源里有
+#        group_vars 里加 ansible_python_interpreter: /usr/bin/python3.11
+#        ★ 但 dnf / package_facts 这两个模块要 import dnf、rpm 的绑定，
+#          而绑定只编给了 3.6 —— 这几处得单独钉回 /usr/libexec/platform-python，
+#          否则装包会失败。所以换镜像是更省事的那条。
+# ---------------------------------------------------------------------------
+ansible-core>=2.16.3,<2.17.0
