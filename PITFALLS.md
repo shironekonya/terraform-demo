@@ -73,13 +73,16 @@
 | 47 | ★ 拉不到镜像不是编排问题，但报错会让人这么以为                          | 第十三 |
 | 48 | ★ 报错行号对不上，说明你排的是旧副本                                  | 第十四 |
 | 49 | ★ 「5xx 才算故障」把「降级但仍在服务」判成了故障                        | 第十四 |
+| 50 | ★ 回滚不是重跑一遍发布                                                | 第十五 |
+| 51 | ★ 单文件 bind mount 把 inode 钉死，换内容不生效                        | 第十五 |
 
 > 轮次导航：[第一轮](#第一轮阿里云部分) · [第二轮](#第二轮本地容器部分) · [第三轮](#第三轮cicd-部分) ·  
 > [第四轮](#第四轮gitlab-部分) · [第五轮](#第五轮拿到真实-compose-文件之后) · [第六轮](#第六轮shell-改写成-python) ·  
 > [第七轮](#第七轮加入-ansible-批量管理层) · [第八轮](#第八轮守住分层边界) · [第九轮](#第九轮cicd-成为唯一触发器--跨层衔接声明化) ·  
 > [第十轮](#第十轮宿主机边界--豁免登记) · [第十一轮](#第十一轮真机联调terraform-交出去之后) ·  
 > [第十二轮](#第十二轮把入口收成一个) · [第十三轮](#第十三轮镜像不是顺手就能拉到的) ·  
-> [第十四轮](#第十四轮在真机上验失败路径不是应该会这样)
+> [第十四轮](#第十四轮在真机上验失败路径不是应该会这样) ·  
+> [第十五轮](#第十五轮发布与回滚回滚到底回的是什么)
 
 ---
 
@@ -777,7 +780,130 @@
     预期内的分支一旦让模块自己报错，它的报错就会盖掉真正的原因 —— 这和 47 是同一个病：
     一个位置只能有一个声音。
 
-## 这 49 条怎么分布
+---
+
+## 第十五轮：发布与回滚（"回滚"到底回的是什么）
+
+50. **★ 回滚 ≠ 重跑一遍发布。**
+
+    最自然的写法是：回滚时把版本号传回去，再跑一次 playbook。
+
+    ```bash
+    ansible-playbook playbooks/site.yml --limit cloud -e wf_release=v1
+    ```
+
+    这条命令看起来完全正确，实际上做的是**用当前模板重新渲染一遍**。
+    而"需要回滚"的典型场景恰恰是模板改坏了 —— 于是它渲染出来的是
+    **旧版本号 + 新内容**：页面上写着 v1，内容和 v1 一点关系都没有。
+    这比不回滚更糟，因为它把"现在跑的是哪一版"这条信息也弄坏了。
+
+    回滚只能发生在**产物**上。所以发布时先把渲染结果落成一份不可变产物：
+
+    ```
+    releases/<版本>/index.html   ← 那次发布留下的原件
+    public/index.html            ← 线上真正被读的那份（产物的拷贝）
+    current                      ← 现在生效的是哪一版
+    history                      ← 发布过哪些版本，顺序即发布顺序
+    ```
+
+    回滚 = 挑版本 → 拷产物 → 从 80 读回版本标记。全程**不出现 template 模块**，
+    这条现在是自测里的一条硬断言（`[5c]`），改坏了会红。
+
+    **规律：凡是"回到之前某个状态"的需求，都得先有那个状态的可寻址副本。
+    「重新生成一次」在生成逻辑没变时才等价于回滚 —— 而逻辑变了才是要回滚的时候。**
+
+51. **★ 单文件 bind mount 把 inode 钉死了，页面换不掉还不报错。**
+
+    compose 原来挂的是单个文件：
+
+    ```yaml
+    volumes:
+      - /opt/wf/stacks/wf-web/index.html:/usr/share/nginx/html/index.html:ro
+    ```
+
+    `docker compose up` 创建容器时，这个路径就被解析成了宿主机上的具体 inode。
+    之后即使把 `index.html` 换成新内容（`copy` 写临时文件再 rename，inode 变了），
+    容器里读到的还是旧 inode —— **页面永远停在上一版，没有任何报错**。
+    `docker exec cat` 看到的是新内容、`curl` 出来是旧内容，这种不对称最难查。
+
+    改成挂目录：
+
+    ```yaml
+    volumes:
+      - /opt/wf/stacks/wf-web/public:/usr/share/nginx/html:ro
+    ```
+
+    目录挂载按路径解析，换目录里的文件立刻生效，**也不用重建容器** ——
+    发布和回滚因此可以做到"不停容器换内容"。自测里有一条断言专门钉它的形状
+    （挂的是 `public:` 目录，且 volumes 里不能出现 `index.html`）。
+
+    **规律：bind mount 的粒度就是"变更粒度"。要换内容，就挂到能装下变化的那一层。**
+
+52. **`roles:` 列表的 dict 写法会静默忽略 `tasks_from`，回滚变成"又发布一次"。**
+
+    想在入口里复用已有 role 的另一个任务文件，第一反应是这么写：
+
+    ```yaml
+    - hosts: cloud
+      roles:
+        - guard
+        - role: app_stack        # ← 看起来很清楚
+          tasks_from: rollback   # ← 这一行 Ansible 不看
+    ```
+
+    结果它老老实实跑了 `app_stack/tasks/main.yml`。**没有任何警告、没有 lint 报错**，
+    只是"回滚"执行完，页面上的版本号变成了最新版 —— 而且还是"变最新一次"，
+    所以不看 history 根本发现不了。
+
+    原因：`roles:` 的 dict 写法只认 `role` / `vars` / `when` / `tags` 这几个键，
+    `tasks_from` 不在其中，被直接丢掉。真正支持 `tasks_from` 的是
+    **`tasks:` 里的 `import_role` / `include_role`**：
+
+    ```yaml
+      roles:
+        - guard
+      tasks:
+        - ansible.builtin.import_role:
+            name: app_stack
+            tasks_from: rollback
+    ```
+
+    `import_role` 和 `include_role` 的取舍：这里要 `import_role`（静态展开），
+    因为它给出了 `--list-tasks` 里能看见的完整任务列表；
+    `include_role` 是运行时才展开，看上去更灵活，但出问题时 `-vvv` 之外什么线索都没有。
+
+    **规律：能"被忽略"的配置项比报错的配置项危险得多。复用的入口只有一个，
+    写完后要有一个形状断言钉住它 —— 现在是自测里的两条：`tasks` 里必须有
+    `app_stack/rollback`，且 `roles:` 列表里不许出现 dict。**
+
+53. **★ 静态护栏不跟进 `import_role`，`tasks_from` 指向的那份文件对检查器不存在。**
+
+    `tools/check_guard.py` 遍历 role 的任务时，原本只跟进 `include_tasks` /
+    `import_tasks`。但上面第 52 条之后，入口长成了 `tasks: [{import_role: ...}]` ——
+    于是 `roles/app_stack/tasks/rollback.yml` 里的两个 `copy`
+    （把产物拷回 `public/`、改 `current` 指针）**一次都没进过 P6 的视野**：
+    往那里再加写操作、或者把这个 play 改成 `hosts: local`，静态检查都是绿的。
+
+    同一个盲区还有一层：`check_playbook` 从 `play["roles"]` 取 role 列表，
+    `tasks:` 里的 `import_role` 不算「这个 play 引用了它」。所以判
+    "解锁型 play 有没有引用 cloud-only role" 时，`app_stack` 根本不在候选里。
+
+    修法就是让检查器的视野和 Ansible 的**实际执行路径**对齐，而不是和
+    "我们以为的写法"对齐：
+
+    ```python
+    if short_module(module) in ("include_role", "import_role") and isinstance(args, dict):
+        target_role = str(args.get("name", "")).strip()
+        tasks_from = str(args.get("tasks_from", "main")).strip() or "main"
+        if target_role and tasks_from != "main":   # main 已由按 role 的遍历覆盖
+            walk(root / "roles" / target_role / "tasks" / f"{tasks_from}.yml", own_gates, seen)
+    ```
+
+    **规律：校验器一旦落后于写法一次，它就不再是一个保护。每引入一种新的
+    任务组织方式（include / roles_dict / tasks_from），都要回头问一句：
+    静态检查的眼睛跟到那里了吗？—— 这次两条新自证用例就是答案的证据。**
+
+## 这 53 条怎么分布
 
 | 轮次 | 主题 | 条目 | 条数 |
 |---|---|---|---|
@@ -795,6 +921,8 @@
 | 第十二轮 | 入口收敛：80 反代容器栈 | 46 | 1 |
 | 第十三轮 | 镜像就位：拉不到时不装死 | 47 | 1 |
 | 第十四轮 | 真机验失败路径 | 48–49 | 2 |
+| 第十五轮 | 发布与回滚 | 50–51 | 2 |
+| 第十六轮 | 流水线驱动发布/回滚 | 52–53 | 2 |
 
 轮次不是按时间堆的，是按**模块**分的 —— 每一轮解决一个模块的问题，
 所以第 7 轮（Ansible）条目最多：那一层的失败模式最不容易在本地复现。

@@ -234,7 +234,7 @@ terraform-demo/
 
 ```bash
 python3 tools/check_boundaries.py                      # 9 条边界逐条报状态
-python3 tools/check_boundaries.py --selftest           # 证明这个检查器真的会响（65 个用例）
+python3 tools/check_boundaries.py --selftest           # 证明这个检查器真的会响（67 个用例）
 python3 tools/check_boundaries.py --require-remote-state   # CI 用：没有远程后端直接失败
 python3 tools/check_boundaries.py --require-ci             # CI 用：没有流水线定义直接失败
 ```
@@ -249,7 +249,7 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 | B4 | `backend "local"`、oss 后端缺 `tablestore_table`、backend 里硬编码凭证 | 没有 backend 块给提示（`--require-remote-state` 时升级为失败） |
 | B5 | 脚本里 `open('terraform.tfstate')`、provisioner 里碰 state 文件 | — |
 | B6 | provisioner / 胶水脚本里 `apt-get install`、`systemctl restart` | `user_data` 豁免（那是实例启动配置，只在创建时跑一次） |
-| B7 | 没有流水线定义；TF 与 Ansible 被塞进同一个 job；变更动作没有人工放行；`site.yml` 不带 `--limit`；碰 local 的 job 没有人工放行；解锁开关被悄悄带上；有一键绕过流水线的入口脚本 | 对流水线做**文本级**结构检查（不是 GitLab CI 语义解析器），约定 `ansible-playbook` 的调用写在一行里 |
+| B7 | 没有流水线定义；TF 与 Ansible 被塞进同一个 job；变更动作没有人工放行；`site.yml` 不带 `--limit`；碰 local 的 job 没有人工放行；解锁开关被悄悄带上；有一键绕过流水线的入口脚本；job 既没有 `tags`、顶层也没有 `default.tags` 兜底 | 对流水线做**文本级**结构检查（不是 GitLab CI 语义解析器），约定 `ansible-playbook` 的调用写在一行里 |
 | B8 | 代码里有跨层调用但没声明；声明写成 `mode: write`；声明的 `to` 不是 terraform；没写 `why`；声明了但代码里找不到（腐烂）；声明文件用了子集之外的写法 | 严格的最小 YAML 子集解析，遇到不认识的写法**报错而不是猜** |
 | B9 | `resource "vsphere_virtual_machine"`、`provider "vsphere"`、`source = "hashicorp/vsphere"`；`vmrun` / `vmware-cmd` / `vmware-vdiskmanager` 调用；`.vmx` / `.vmdk` 路径；豁免清单里没写 `why`、或登记了不存在的路径 | 命令类只在**执行上下文**里找（`error_message = "找不到 vmrun.exe"` 是提示文本，不算）；豁免判据是**清单**，不是目录名 |
 
@@ -591,7 +591,7 @@ expected_compose = templatefile("${path.module}/templates/jenkins-compose.yaml.t
 
 ```bash
 python3 tools/check_boundaries.py             # 九条边界逐条检查 + 复核 boundaries.yml 的衔接登记
-python3 tools/check_boundaries.py --selftest  # 65 个用例，证明检查器确实会响
+python3 tools/check_boundaries.py --selftest  # 67 个用例，证明检查器确实会响
 ```
 
 `ansible/` 那一层还有三个独立检查（依赖 PyYAML —— 装了 Ansible 的机器上一定有）：
@@ -603,7 +603,7 @@ python3 tools/check_guard.py --selftest  # 13 个用例
 python3 tools/selftest.py                # 离线自测：模板渲染 + 保护公式真值表（16 种开关组合）
 ```
 
-判据：前两条输出「通过」与「自证通过：65 个用例」，后三条不出现 `✗`。
+判据：前两条输出「通过」与「自证通过：67 个用例」，后三条不出现 `✗`。
 
 > CI 里跑的是更严格的一档：`python3 tools/check_boundaries.py --require-remote-state --require-ci`。
 > 它把「已有远程 state」「已声明 CI 入口」也算作必须满足的条件，而这两项在本地首次跑时本来就不满足，
@@ -777,6 +777,32 @@ GitLab 要放行私有网段回调（`gitlab_allow_local_requests`，默认已�
 `registry-mirrors` 配了却仍然超时的经典原因是：`daemon.json` 只在**启动时**读一次。
 所以 `docker_engine` 写完会 `flush_handlers` 重启 docker，再断言 `docker info` 里
 真的出现了这条地址 —— 文件是"我以为的状态"，守护进程才是"它实际的样子"。
+
+### 发布与回滚：版本落在**产物**上
+
+「变更」和「回滚」如果没有版本号，就都落不到实处：只能重新跑一遍 playbook，
+而"上一版是什么、还在不在"没人说得清。所以这里给每次部署一个名字，并把模型压到最小：
+
+| 路径 | 是什么 | 谁写 |
+|---|---|---|
+| `releases/<版本>/index.html` | 这次发布的**不可变产物** | 发布时渲染一次，之后不再改 |
+| `public/index.html` | 线上真正被 nginx 读的那一份 | 发布/回滚时从产物拷过来 |
+| `current` | 当前生效的版本名 | 发布/回滚结束时更新 |
+| `history` | 发布过的版本，一行一个 | `lineinfile` 追加，同名不重复 |
+
+**回滚不是"再跑一遍发布"。** 再跑一遍会用**当前模板**重新渲染，
+得到的是"旧版本号 + 新内容" —— 这正是最需要回滚的场景（模板改坏了）里最糟的结果。
+所以回滚只做三件事：从 `history` 挑版本 → 把那一版的产物拷回 `public/` → 从 80 读回版本标记。
+`roles/app_stack/tasks/rollback.yml` 里**没有任何 template 模块**，自测把这一条钉死了。
+
+版本名由 CI 传 `-e wf_release=$CI_COMMIT_SHORT_SHA`；本地手跑时默认叫 `local`。
+自检读的是页面里的 `<meta name="wf-release" content="...">`，而不是"文件拷过去了没有" ——
+200 只证明反代通，证明不了线上是哪一版。
+
+**容器挂的是目录，不是单个文件。** 单文件 bind mount 在 `docker compose up` 时
+就把宿主机那一份的 inode 钉在容器里，之后换内容容器读不到，页面永远停在上一版，
+而且没有任何报错。挂目录则是按路径解析，换文件立刻生效、不用重建容器 ——
+发布和回滚能"不停容器换内容"，靠的就是这一点。
 
 ### 操作步骤
 
@@ -1256,6 +1282,52 @@ gitlab_webhook_test_on_apply = true   # 验证时临时打开
 
 所以备份比容器部署**更紧迫**：请定期跑 `sudo gitlab-backup create`，并确认 `/var/opt/gitlab/backups` 里有备份文件。盘点输出会打印备份目录现状——如果显示「备份目录不存在」，说明你的仓库还没有第二份拷贝，值得尽快处理。
 
+### CI 执行器：装在 147，用 shell executor
+
+流水线要干的事是「terraform + ansible 去改云机器和本机」。147 上已经有
+terraform 1.16、ansible-core 2.21、docker、以及云机器的 SSH key，而且它和 GitLab(139)
+在同一网段 —— 工具链在哪儿，执行就在哪儿。
+
+| 选择 | 没选的原因 |
+|---|---|
+| **shell executor（选它）** | 直接用宿主机工具链：provider 缓存、`~/.ssh`、`~/.aliyun` 都在原地。代价是隔离性差，只适合单机自用 |
+| docker executor | 每个 job 先拉镜像，镜像里没有 provider 缓存和密钥，于是 CI 第一步变成"先配环境"，和"用 CI 收敛变更"正好相反 |
+| GitHub Actions | 147 到 `github.com` 是 `000`（内网只有 GitLab 通），self-hosted runner 连注册都做不到 |
+
+```bash
+# 在 147 上（脚本幂等，重复执行只做 verify）
+sudo GITLAB_URL=http://192.168.193.139:8000 \
+     RUNNER_TOKEN=glrt-xxxxxxxx \
+     ./tools/install_runner.sh
+```
+
+`concurrent = 1` 不是性能考虑，是正确性考虑：Terraform 的 state 锁能挡住并发 apply，
+但 ansible 侧没有锁 —— 两个 job 同时改同一台机器，谁最后写谁赢，失败还难复现。
+
+#### 为什么要在 config.toml 里写 PATH，而且是探测出来的
+
+shell executor **不继承登录 shell 的 PATH**，它只用 `config.toml` 里 `environment` 写的那一份。
+147 上 terraform 在 `/usr/local/bin`、ansible 在 `~/.venvs/ansible/bin` ——
+后者不在标准 PATH 里。漏了它的症状是流水线第一行 `command not found` 就红了，
+而流水线本身不会告诉你这是 PATH 的事。
+
+所以脚本不是"把标准路径抄一遍"，而是 `shutil.which` 探测真实位置再写回去
+（换台机器这段不用改）。配套地，`.gitlab-ci.yml` 的 `before_script` 里有一段
+工具链自检（`python3` / `terraform` / `ansible-playbook`），缺哪个报哪个并给出修法 ——
+**让"环境没配好"和"流水线真的失败了"在第一行就分得开。**
+
+同一个原因还决定了另一件事：`.gitlab-ci.yml` 里必须写 `tags`（顶层 `default` 里兜底），
+因为手工登记的 runner 大概率是 `--run-untagged=false`（本项目就是这么装的）。
+没有 tag 的 job 既不会失败也不会超时，只是在界面上一个灰圈一直转、状态写着 `stuck` ——
+看起来"流水线在跑"，其实一步都没开始。这条现在是 B7 的第 7 条子规则。
+
+脚本做的事（装包、起服务）属于"机器内部状态"，本该归 Ansible（B6）；
+但执行器**无法由自己的流水线安装自己**，所以它作为一次性 bootstrap 登记在
+`boundaries.yml` 的豁免段里，理由写在旁边。
+
+项目里需要配的 CI 变量：`ALICLOUD_ACCESS_KEY`、`ALICLOUD_SECRET_KEY`（Masked）、
+`WF_SSH_KEY_FILE`（File 类型）、`WF_SSH_USER`。
+
 ### 排查速查表
 
 | 现象 | 先查哪里 |
@@ -1676,11 +1748,12 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 （在一台 Ubuntu 26.04 / ansible-core 2.21.4 的 Linux 机器上完整跑过五幕，
 用 WSL 主机同时扮演 `cloud` 组和 `local` 组的受管机）。
 
-#### 第一段：静态 + 离线（136 项断言 + 13 个校验器自证用例，全部通过）
+#### 第一段：静态 + 离线（166 项断言 + 19 个校验器自证用例，全部通过）
 
 | 验证项 | 做法 | 结果 |
 |---|---|---|
-| **保护机制真的拦得住** | `tools/check_guard.py --selftest`：13 个用例，5 个"应拦下"、5 个"应放行"（含 P8 的 3 个位置用例）、3 个 role 写入门 | ✓ 该拦的拦下了，该放行的放行了 |
+| **保护机制真的拦得住** | `tools/check_guard.py --selftest`：19 个用例，8 个"应拦下"、8 个"应放行"（含 P8 的 3 个位置用例）、3 个 role 写入门 | ✓ 该拦的拦下了，该放行的放行了 |
+| ↑ **import_role 的旁路** | 自证里两个新用例：cloud-only role **只出现在 `tasks:` 的 `import_role` 里**（还有它的反向），以及 `tasks_from` 指向的那份文件有没有被 P6 遍历到 | ✓ 修复前用例是红的 —— 它们是这条规则存在的证据，见 [踩坑 53](PITFALLS.md) |
 | ↑ **反向验证** | 故意把幕 C 的 `hosts: cloud` 改成 `hosts: all`；另一轮去掉幕 E 的解锁门闩 | ✓ 两次都被抓到，且给出了正确原因（"变更型 play 的 hosts 可能包含本地服务器"）；改回后重新确认通过 |
 | **保护公式的真值表** | `tools/selftest.py` 从 `roles/guard/tasks/main.yml` **读出公式本身**求值（不是重抄一份） | ✓ 11 个场景 + **穷举全部 16 种开关组合**，断言"可覆盖 ⟹ 变更已解锁"始终成立 |
 | ↑ **反向验证** | 把 `wf_can_write` 临时改回"只认覆盖开关"的松散写法 | ✓ 穷举立刻报错并列出反例（`在local=True 变更=False 覆盖=True`）；改回后重新确认通过 |
@@ -1691,6 +1764,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | **云清单生成器** | `summary` 正常路径 / 退化为 `instance_public_ips` / 空输出 | ✓ 三种输入都产出合法 YAML，且**不会生成 `local` 组** |
 | **24 个 YAML 文件全部可解析** | `selftest.py` 第 1 项 | ✓ |
 | **镜像就位流程的形状** | `selftest.py` 第 5d 项（21 条断言）：拉取是不是独立任务、有没有 `timeout`、`up -d` 有没有「镜像已就位」门槛、失败信息里有没有三条路、80 自检是否接受「旧容器仍在服务」；另外把 `wf_stack_image_ready` 的表达式单独求值（6 种输入） | ✓ 结构成立、表达式真值正确（含 check 模式与变量未定义两种输入）；真机两条分支见第 14 / 15 行 |
+| **发布与回滚的模型** | `selftest.py` 第 5c 项（27 条断言）：产物是否落 `releases/<版本>/`、线上目录是不是产物的拷贝、当前版本指针有没有写、历史是否用 `lineinfile` 追加、回滚里有没有 `template` 模块（必须没有）、挑版本表达式的 6 种输入 | ✓ 结构成立、表达式真值正确；**真机未跑**（ECS 已释放），见下 |
 
 #### 第二段：真机验证（9 轮运行，5 个验收性质全部成立）
 
@@ -1707,7 +1781,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | 6 | **云侧真跑** | 临时清单入 `cloud` 组 + 传 `wf_docker_registry_mirrors` | ✓ Docker（docker.io 29.1.3 + compose v2 2.40.3）装上、`daemon.json`（含 mirrors 分支）写入、**nginx 容器在 8080 端口跑起来**，`curl` 拿到渲染的首页 |
 | 7 | **云侧幂等（修 bug 后）** | 连跑两次 `site.yml` | ✓ 第二次 `changed=0`，容器 healthy。第一次跑抓到了一个真 bug：首页嵌了渲染时间 → 每次都"变了" → 容器被无谓重启，见 [踩坑 28](PITFALLS.md) |
 | 8 | **双组冲突拦截** | 同一台机器同时放进 `cloud` 和 `local` | ✓ `guard` 的断言当场 fatal，报「一台机器不能两者都是」并指出该保留哪个组 |
-| 9 | **静态工具在 Linux 上复跑** | `check_guard.py` / `--selftest` / `selftest.py` | ✓ 8 类不变量、13 个用例、136 项断言在真实 Linux + Python 3.14 环境下同样全部通过 |
+| 9 | **静态工具在 Linux 上复跑** | `check_guard.py` / `--selftest` / `selftest.py` | ✓ 8 类不变量、**13** 个用例、**165** 项断言在真实 Linux + Python 3.14 环境下同样全部通过（第 16 轮补的 import_role 旁路用例尚未在 Linux 上复跑，本机 Windows + CPython 3.13 通过） |
 
 **2026-09-30 复跑了一遍**（换了台 WSL 实例，确认上一轮结论不是那台机器的偶然）：
 
@@ -1726,6 +1800,8 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
   它们不在这台 WSL 的网络可达范围内
 - ~~阿里云真机（清单没喂过真实 `terraform output`）~~ —— **已补上**：2026-10-22 用 `aliyun-ecs/tf-outputs.json` 生成了 `inventory/hosts.cloud.yml`（`ansible_host: 121.196.x.x`），`--limit cloud` 全流程跑通
 - `docker compose` 版本差异导致的行为差别（真机上是 2.40.3，只验了这一个版本）
+- 发布/回滚这条链路只在离线验了形状与表达式真值，**没在真机上跑过**
+  「发 v1 → 发 v2 → 回滚到 v1」的完整过程（这一轮 ECS 已 destroy，没有可跑的目标机）
 - 三条出路里**「离线镜像包」那条**：只在离线验了任务形状（上传 → `docker load` → 删临时包），
   没在真实 ECS 上跑过完整一遍（加速器那条已在 2026-10-22 真机验过，见第 14 / 15 行）
 - `docker info` 里 Registry Mirrors 段**超过 3 条地址**时会少看几行（断言用 `grep -A3`）——
@@ -1733,7 +1809,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 
 ↑ 曾经还有一条「B9 与豁免清单只在 Windows 上跑过」，**这一条已经补上**：2026-09-30 在
 同一台 Linux（Ubuntu 26.04 / Python 3.14.4）上把边界检查器完整复跑了一遍 ——
-65 个自证用例、142 个文件的全量扫描、以及 8 个破坏性场景（含改名脱离豁免那条），
+67 个自证用例、142 个文件的全量扫描、以及 8 个破坏性场景（含改名脱离豁免那条），
 结果与 Windows 侧**逐项一致**（同名场景命中数 1 / 1 / 1 / 8 / 1 / 29 / 0+提示）。
 运行前先核对过两侧文件指纹：`boundaries.yml`、`check_boundaries.py`、`README.md`、
 `.gitlab-ci.yml`、`ansible.cfg` 五个文件的 sha1 完全相同，所以「在 Linux 上验过」这句话
@@ -1742,7 +1818,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 ### `tools/` 分层边界的验证状态
 
 边界检查器 `check_boundaries.py` 的验证方式是「静态 + 自证 + 对真实仓库做破坏性验证」，
-共 **65 个自证用例**，全部通过。它**只用标准库**
+共 **67 个自证用例**，全部通过。它**只用标准库**
 （`argparse` / `pathlib` / `re` / `shutil` / `tempfile`），不依赖 yaml，也不依赖 Ansible。
 
 | 验证项 | 做法 | 结果 |
@@ -1751,7 +1827,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | **该放的放得开** | `--selftest`：23 个「应当放行」用例 | ✓ 见下 |
 | ↑ 放行类里最关键的几个 | 注释里的 `ansible-playbook` / `kubectl` / `tfstate`；`echo` 提示文本里的 `apt-get install`；Python 文档字符串里的 `systemctl`；`user_data` 里的 `dnf install`；`kubernetes_namespace` / `kubernetes_nodes`；一份**规范的流水线** | ✓ 全部不误报 —— **误报率决定这类工具能不能活下去** |
 | **反向验证（跨工具）** | `subprocess.run(['terraform','apply'])` vs `terraform output -json` | ✓ 前者命中 B2，后者放行 |
-| **反向验证（B7 的六条子规则）** | 从一份规范流水线出发，**每次只改一处**：拿掉 `when: manual` / 去掉 `--limit` / `--limit` 换成 `local` / 给自动 job 带上解锁开关 / 把 TF 与 Ansible 塞进同一个 job / 加一个 `deploy.sh` | ✓ 每一条都各自命中，改一处只响一处 |
+| **反向验证（B7 的七条子规则）** | 从一份规范流水线出发，**每次只改一处**：拿掉 `when: manual` / 去掉 `--limit` / `--limit` 换成 `local` / 给自动 job 带上解锁开关 / 把 TF 与 Ansible 塞进同一个 job / 加一个 `deploy.sh` / 去掉 `tags` 兜底 | ✓ 每一条都各自命中，改一处只响一处 |
 | **反向验证（B8 的六条子规则）** | 未登记 / `mode: write` / `to: ansible` / 缺 `why` / 引号未闭合 / 顶层多一个键 | ✓ 同上；且解析失败**只报一次**（不叠加一条假的「没写 why」） |
 | **反向验证（B9 的三类痕迹 + 豁免机制）** | 三类痕迹各来一遍：`resource "vsphere_virtual_machine"` / `provider "vsphere"` 与 `source = "hashicorp/vsphere"` / `.vmx` 路径 / `vmrun` 调用（Terraform、Python、Ansible、shell 各一种）；放行类：`error_message = "找不到 vmrun.exe"`、`vmrun_path` 变量名、注释与 `.md` 文档。豁免机制正反各一遍：同样的违规代码，登记过豁免就放行、没登记就报 | ✓ 12 个命中/提示、7 个放行全部符合预期；豁免那组是**唯一变量**对照（同文件同内容，只在清单里加一行），所以响了就一定是豁免机制在起作用 |
 | **B8 / B9 不重复报账** | 构造一个「顶层多了个键 + exemptions 段」的文件，只看 B9 | ✓ B9 报 0 —— 顶层结构错归属 B8。**同一条错误被两条规则各报一遍**是这次重构差点留下的坑：解析是全文一次做完的，不给错误标上归属就会出现「一个毛病、两条报告」 |
@@ -1798,7 +1874,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 
 - ~~检查器只在 Windows 的 Python 3.13 / 3.15 上跑过~~ —— **2026-09-30 已补上**。
   同一份代码（五个关键文件 sha1 两侧一致）在一台真实 Linux（Ubuntu 26.04 / Python 3.14.4）
-  上复跑：65 个自证用例全过、142 个文件全量扫描九条边界全绿、上表 S6–S12 那 8 个破坏性场景
+  上复跑：67 个自证用例全过、142 个文件全量扫描九条边界全绿、上表 S6–S12 那 8 个破坏性场景
   再走一遍，命中数与 Windows 侧**逐项相同**（1 / 1 / 1 / 8 / 1 / 29 / 0+提示），
   每个场景还原后还做了逐字节核对
 - 边界检查是**静态的**：它证明「代码里没有越界的写法」，不证明「运行时各工具真的没抢对象」

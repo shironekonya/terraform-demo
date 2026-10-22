@@ -85,3 +85,5 @@ exemptions:
     why: "停用的旧方案：用 vmrun 从模板克隆宿主机上的虚机。它与本项目的边界「组件全部跑在虚拟机内部、宿主机只提供虚拟化能力、宿主机上的虚拟化平台不声明为资源」直接相悖，已停用，仅留作教学对照。不参与运行，也不参与任何检查。"
   - path: vmware-vsphere-reference
     why: "语法参考：vSphere 官方 provider 的写法，供以后真要迁到 vCenter/ESXi 时对照。需要 vCenter 才能 init，本项目不用它。因此不作为「在用模块」检查（也就不需要 backend），不参与运行。"
+  - path: tools/install_runner.sh
+    why: "CI 执行器自身的引导脚本（一次性 bootstrap，跑完即退出运行路径）。它装包、起服务，正是 B6 说的「机器内部状态」—— 但这里做不到交给 Ansible：脚本装的是**运行 Ansible 的那台机器的 runner**，鸡生蛋问题，执行器无法由自己的流水线安装自己。装完之后，runner 主机上的任何进一步变更仍归 Ansible（且它在 local 组，默认只读）。因此登记为豁免，而不是让 B6 的提示长期挂着、慢慢变成背景噪音。"

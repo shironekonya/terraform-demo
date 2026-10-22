@@ -1069,6 +1069,31 @@ def split_jobs(text: str) -> list[tuple[str, list[str]]]:
     return jobs
 
 
+def _ci_default_has_tags(text: str) -> bool:
+    """`default:` 段里有没有 tags（所有 job 的兜底）。
+
+    只是**兜底判定**：写了它就不用每个 job 重复一遍，
+    但一旦写了，这里就认它存在 —— 不去校验 tag 名字和 runner 是否匹配，
+    那是 GitLab 的事，静态扫不到。
+    """
+    in_default = False
+    for raw in text.splitlines():
+        code = strip_hash_comment(raw)
+        if not code.strip():
+            continue
+        key = _top_level_key(code)
+        if key is not None:
+            in_default = key == "default"
+            continue
+        if in_default and re.match(r"^\s+tags:\s*$", code):
+            return True
+    return False
+
+
+def _job_has_tags(body: list[str]) -> bool:
+    return any(re.match(r"^\s+tags:\s*$", ln) for ln in body)
+
+
 def check_bypass_scripts(root: pathlib.Path, rep: Report) -> None:
     # 找到所有需要检查的文件中，对 terraform 的每一次调用，
     # 都要检查一下是否是「一个人就能改环境」的入口脚本。
@@ -1150,8 +1175,11 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
     for path in ci_files:
         rep.scanned += 1
         where = rel(root, path)
+        text = read_text(path)
+        # 有的话，job 里不写 tags 也能被调度；没有就逐个 job 查。
+        default_has_tags = _ci_default_has_tags(text)
 
-        for job_name, body in split_jobs(read_text(path)):
+        for job_name, body in split_jobs(text):
             # 过滤掉空 job
             executed = [ln for ln in body if ln.strip()]
             if not executed:
@@ -1245,7 +1273,28 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                     ),
                 )
 
-    # ---- ⑤ 流水线只覆盖了一半 ------------------------------------------
+            # ---- ⑤ 没有 tags 也没有兜底 → job 会永远 pending ----------------
+            # 这条是补在「流水线半天不动」那次之后的：
+            # job 界面显示灰色圆圈一直转，理由只写 "stuck"，
+            # 因为它既不报错、也不超时 —— 而 self-hosted runner 大概率是
+            # --run-untagged=false 注册的（本项目就是），于是永远等不到。
+            if not default_has_tags and not _job_has_tags(executed):
+                rep.fail(
+                    "B7", job_where,
+                    "这个 job 既没有 tags、顶层也没有 default.tags 兜底",
+                    hint=(
+                        "self-hosted runner 通常注册成 --run-untagged=false（本项目\n"
+                        "tools/install_runner.sh 就是这么装的）。没有 tag 的 job\n"
+                        "不会被分配给它，结果是界面上一个灰圈一直转、状态写着 stuck，\n"
+                        "既不报错也不超时 —— 看流水线像是在跑，其实一步都没开始。\n"
+                        "修法二选一：\n"
+                        "    job 内写       tags: [wf-infra]\n"
+                        "    或顶层兜底     default:\\n  tags: [wf-infra]\n"
+                        "名字要和注册时的 --tag-list 一致。"
+                    ),
+                )
+
+    # ---- ⑥ 流水线只覆盖了一半 ------------------------------------------
     # 接手：流水线只覆盖了一半，说明有变更类动作，但没有 ansible-playbook 调用
     if saw_tf_mutation and not saw_ansible:
         rep.warn(
@@ -2159,6 +2208,11 @@ def selftest() -> int:
         "  - plan\n"
         "  - configure\n"
         "\n"
+        # tags 写在 default 里当兜底 —— 和真实仓库的形状一致
+        "default:\n"
+        "  tags:\n"
+        "    - wf-infra\n"
+        "\n"
         "apply:\n"
         "  stage: plan\n"
         "  rules:\n"
@@ -2180,6 +2234,36 @@ def selftest() -> int:
         "B7", 0, 0,
     )
     case(
+        "B7 命中：job 既没有 tags、顶层也没有 default.tags（会永远 stuck）",
+        {
+            ".gitlab-ci.yml":
+                "stages:\n"
+                "  - deploy\n"
+                "\n"
+                "plan:\n"
+                "  stage: deploy\n"
+                "  script:\n"
+                "    - cd aliyun-ecs && terraform plan -out=tfplan\n",
+        },
+        "B7", 1, 0,
+    )
+    case(
+        "B7 放行：tags 写在 job 自己身上（不靠 default 兜底也行）",
+        {
+            ".gitlab-ci.yml":
+                "stages:\n"
+                "  - deploy\n"
+                "\n"
+                "plan:\n"
+                "  stage: deploy\n"
+                "  tags:\n"
+                "    - wf-infra\n"
+                "  script:\n"
+                "    - cd aliyun-ecs && terraform plan -out=tfplan\n",
+        },
+        "B7", 0, 0,
+    )
+    case(
         "B7 提示：仓库里没有任何流水线定义",
         {"aliyun-ecs/main.tf": 'resource "null_resource" "x" {}\n'},
         "B7", 0, 1,
@@ -2194,6 +2278,12 @@ def selftest() -> int:
         {".gitlab-ci.yml":
             "stages:\n"
             "  - deploy\n"
+            "\n"
+            # tags 兜底在这里是必要的背景，不是被测项 ——
+            # 少了它这一个用例会同时命中「缺 tags」，看不出真正测的是哪一条
+            "default:\n"
+            "  tags:\n"
+            "    - wf-infra\n"
             "\n"
             "deploy:all:\n"
             "  stage: deploy\n"

@@ -19,6 +19,30 @@ wf_stack_port: 8080
 wf_stack_image: nginx:alpine
 
 # ---------------------------------------------------------------------------
+# 发布与回滚
+#
+# 为什么要有「版本」：没有版本号时，"变更"和"回滚"就没有落点 ——
+# 只能重新跑一遍 playbook，而"上一版是什么、还在不在"没人说得清。
+#
+# 模型（刻意做小，够用即可）：
+#
+#   releases/<release>/index.html   本次发布的**不可变产物**
+#   public/index.html               线上真正被 nginx 读的那一份（产物的拷贝）
+#   current                         当前生效的版本名
+#   history                         发布过的版本，一行一个，顺序即发布顺序
+#
+# 回滚 = 把旧产物重新拷回 public/，**不是**再跑一遍 playbook ——
+# 再跑一遍会用当前模板重新渲染，那是"把旧版本号贴到新内容上"，不是回滚。
+# ---------------------------------------------------------------------------
+# 版本名由 CI 传入（$CI_COMMIT_SHORT_SHA）；本地手工执行时叫 local。
+wf_stack_release: "{{ wf_release | default('local') }}"
+
+wf_stack_release_root: "{{ wf_stack_dir }}/releases"
+wf_stack_public_dir: "{{ wf_stack_dir }}/public"
+wf_stack_current_file: "{{ wf_stack_dir }}/current"
+wf_stack_history: "{{ wf_stack_dir }}/history"
+
+# ---------------------------------------------------------------------------
 # 镜像从哪来 —— 顺序是「离线包 → 本机已有 → 远程拉」
 #
 # ★ 为什么把「拿到镜像」从 `docker compose up -d` 里拆出来单独做：

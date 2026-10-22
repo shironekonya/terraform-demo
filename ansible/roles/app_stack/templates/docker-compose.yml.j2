@@ -18,7 +18,13 @@ services:
     ports:
       - "127.0.0.1:{{ wf_stack_port }}:80"
     volumes:
-      - {{ wf_stack_dir }}/index.html:/usr/share/nginx/html/index.html:ro
+      # ★ 挂**目录**，不挂单个文件。
+      #   单文件 bind mount 在 `docker compose up` 时就把宿主机那一份的 inode
+      #   钉在容器里了：之后宿主机换了内容（哪怕文件路径没变），容器里读到的
+      #   还是旧 inode，页面永远是上一版 —— 而且没有任何报错。
+      #   挂目录则是按路径解析，换目录里的文件立刻生效，也不用重建容器。
+      #   （发布/回滚正是靠这一点做到"不停容器换内容"。）
+      - {{ wf_stack_public_dir }}:/usr/share/nginx/html:ro
     environment:
       WF_HOST: "{{ inventory_hostname }}"
       WF_ADDR: "{{ ansible_host | default('') }}"

@@ -59,10 +59,48 @@
           模板：roles/app_stack/templates/docker-compose.yml.j2
         quiet: true
 
-    - name: "app_stack · 渲染容器首页（每台机器内容不同）"
+    # -----------------------------------------------------------------------
+    # 发布：先落一份不可变产物，再把它拷到线上目录
+    #
+    #   产物（releases/<release>/）是"这一版长什么样"的唯一凭据 ——
+    #   回滚只认它。所以产物一旦写成就别再改：
+    #   同一个 release 名重复部署时内容应该完全一样（模板是事实的函数，不含时间），
+    #   不一样就说明有人用同名发了不同内容，那是版本命名的问题，不是发布的问题。
+    # -----------------------------------------------------------------------
+    - name: "app_stack · 创建本版产物目录"
+      ansible.builtin.file:
+        path: "{{ wf_stack_release_root }}/{{ wf_stack_release }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "app_stack · 渲染本版首页（每台机器内容不同）"
       ansible.builtin.template:
         src: index.html.j2
-        dest: "{{ wf_stack_dir }}/index.html"
+        dest: "{{ wf_stack_release_root }}/{{ wf_stack_release }}/index.html"
+        owner: root
+        group: root
+        mode: "0644"
+      register: wf_stack_artifact
+
+    - name: "app_stack · 创建线上目录"
+      ansible.builtin.file:
+        path: "{{ wf_stack_public_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    # ★ copy（而不是 symlink）：容器挂的是 public/ 这个目录，
+    #   换目录里的文件按路径解析、立刻生效；软链是"目录里的一个 entry"，
+    #   也能生效，但会让 public/ 里那个文件变成一个指向别处的指针，
+    #   排查时多一层间接。拷贝更直白，代价只是多一份 4KB 的文件。
+    - name: "app_stack · 把本版产物发布到线上目录"
+      ansible.builtin.copy:
+        src: "{{ wf_stack_release_root }}/{{ wf_stack_release }}/index.html"
+        dest: "{{ wf_stack_public_dir }}/index.html"
+        remote_src: true
         owner: root
         group: root
         mode: "0644"
@@ -228,6 +266,28 @@
       changed_when: false
       failed_when: false
 
+    # 只在"镜像到位、栈确实起来了"之后才记账 ——
+    # 没起来还记成已发布，等于让回滚去回一个从未生效的版本。
+    - name: "app_stack · 记录当前版本（回滚靠它找前一版）"
+      ansible.builtin.copy:
+        content: "{{ wf_stack_release }}\n"
+        dest: "{{ wf_stack_current_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: wf_stack_image_ready | bool
+
+    # lineinfile 天然幂等：同一版本重复部署只会命中已有那一行，不追加。
+    - name: "app_stack · 本版记入发布历史（只追加，不重复）"
+      ansible.builtin.lineinfile:
+        path: "{{ wf_stack_history }}"
+        line: "{{ wf_stack_release }}"
+        create: true
+        owner: root
+        group: root
+        mode: "0644"
+      when: wf_stack_image_ready | bool
+
 # ---------------------------------------------------------------------------
 # 对外入口：80 → 本栈
 #
@@ -308,12 +368,33 @@
       ansible.builtin.uri:
         url: "http://127.0.0.1/"
         status_code: 200
+        return_content: true
         timeout: 5
       register: wf_front_check
       changed_when: false
       retries: 5
       delay: 2
       until: wf_front_check.status | default(0) == 200
+      when:
+        - not ansible_check_mode
+        - wf_stack_image_ready | default(false) | bool
+
+    # ★ 只验"80 返回 200"是不够的：200 只能证明反代通，
+    #   证明不了"线上跑的是这一版"。容器挂目录时，页面内容换了但容器没重建，
+    #   这种事没有任何报错 —— 只有把版本标记读回来才能发现。
+    - name: "app_stack · 断言：线上页面就是本版，不是上一版"
+      ansible.builtin.assert:
+        that:
+          - ('<meta name="wf-release" content="' ~ wf_stack_release ~ '">') in (wf_front_check.content | default(''))
+        fail_msg: |
+          ⛔ 80 是通的，但页面上的版本标记不是 {{ wf_stack_release }}。
+          说明 public/ 里的内容没有真的换掉，或者容器挂的还是旧路径。
+
+          手工复核：
+            cat {{ wf_stack_dir }}/docker-compose.yml | grep volumes -A2
+            cat {{ wf_stack_public_dir }}/index.html | grep wf-release
+            docker exec {{ wf_stack_name }} cat /usr/share/nginx/html/index.html | grep wf-release
+        quiet: true
       when:
         - not ansible_check_mode
         - wf_stack_image_ready | default(false) | bool
@@ -364,6 +445,7 @@
   ansible.builtin.debug:
     msg:
       - "栈目录        : {{ wf_stack_dir }}"
+      - "版本          : {{ wf_stack_release }}（产物在 {{ wf_stack_release_root }}/{{ wf_stack_release }}/）"
       - "镜像          : {{ wf_stack_image }} —— {{ '本次未执行容器部署' if wf_stack_image_ready is not defined else ('已就位' if (wf_stack_image_ready | bool) else '⛔ 没拿到（见下面的失败原因）') }}"
       - "公网入口      : http://{{ ansible_host | default(inventory_hostname) }}/   （80 → 127.0.0.1:{{ wf_stack_port }}）"
       - "本次是否动了  : {{ '是' if (wf_stack_up is defined and wf_stack_up is changed) else '否（已是最新，changed=0）' }}"

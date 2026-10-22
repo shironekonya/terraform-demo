@@ -3,7 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ inventory_hostname }} · 由 Ansible 批量配置</title>
+  {#- 版本标记：部署与回滚都靠它自检「线上到底是哪一版」。
+      写成 meta 而不是正文里的裸字符串，是因为正文里出现 "v1" 这种短串
+      有可能被别的内容撞上；带属性名的整串不会。 -#}
+  <meta name="wf-release" content="{{ wf_stack_release }}">
+  <title>{{ inventory_hostname }} · 由 Ansible 批量配置（{{ wf_stack_release }}）</title>
   <style>
     :root { color-scheme: light; }
     body {
@@ -33,6 +37,7 @@
       <dt>内核</dt><dd>{{ ansible_kernel | default('-') }}</dd>
       <dt>vCPU / 内存</dt><dd>{{ ansible_processor_vcpus | default('-') }} 核 / {{ ((ansible_memtotal_mb | default(0)) / 1024) | round(1) }} GB</dd>
       <dt>容器</dt><dd>{{ wf_stack_name }}</dd>
+      <dt>版本</dt><dd>{{ wf_stack_release }}</dd>
     </dl>
     <div class="foot">
       ★ 页面内容里**不能出现渲染时间**：template 模块靠「渲染结果和线上一模一样」判断要不要动手，<br>

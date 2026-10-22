@@ -1,0 +1,36 @@
+---
+# ===========================================================================
+# rollback.yml —— 把云服务器上的应用退回上一版（或指定版本）
+#
+# 这是"变更"的反向操作，但仍然是一次**写操作**，所以：
+#   · intent 声明为 mutate（guard 会按可变更的规则检查）
+#   · roles 的第一个必须是 guard
+#   · 只碰 cloud —— 本地服务器上的服务不归这套发布模型管
+#
+# 用法：
+#   ansible-playbook playbooks/rollback.yml --limit cloud
+#   ansible-playbook playbooks/rollback.yml --limit cloud -e wf_rollback_to=<版本名>
+#
+# ★ 为什么任务体用 import_role 而不是 roles: 列表里写 tasks_from：
+#   roles: 的 dict 写法只认 role/vars/when/tags，**tasks_from 会被静默忽略**，
+#   于是它会老老实实跑 main.yml —— 也就是"回滚"变成了"又发布了一次"，
+#   而且没有任何报错。import_role 才支持 tasks_from（见 PITFALLS 第 52 条）。
+#
+# 任务体放在 role 里，是为了共享它的 defaults（栈目录、releases、history 的位置），
+# 避免同一个路径在 playbook 里再抄一遍、然后慢慢抄歪。
+# ===========================================================================
+
+- name: "回滚：云服务器（可变更）"
+  hosts: cloud
+  # 回滚不需要 facts：它只读写 /opt/wf 下的文件、再 curl 一下 80。
+  # gather_facts 在几十台机器上就是几十次 SSH 往返，换不来任何判断依据。
+  gather_facts: false
+  vars:
+    intent: mutate
+  roles:
+    - guard
+  tasks:
+    - name: "回滚 · 载入 app_stack 的 rollback 任务"
+      ansible.builtin.import_role:
+        name: app_stack
+        tasks_from: rollback

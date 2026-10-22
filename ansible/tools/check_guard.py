@@ -632,6 +632,31 @@ def role_names(play: dict) -> list[str]:
     return [n for n in names if n]
 
 
+def role_names_in_tasks(play: dict) -> list[str]:
+    """tasks / pre_tasks / post_tasks 里用 import_role / include_role 引入的 role。
+
+    为什么要单独拎出来：
+        tasks_from 只有写在 **tasks 里的 import_role** 上才生效 ——
+        roles: 列表的 dict 写法（- role: app_stack / tasks_from: rollback）
+        会被 Ansible 静默忽略、照跑 main.yml（PITFALLS 第 52 条）。
+        于是这类入口不得不写成 tasks: [{import_role: ...}]，
+        而 role_names() 只看 roles: 列表 —— 少了这一步，
+        playbooks/rollback.yml 里的 app_stack 就完全不出现在 P4/P5 的视野里：
+        把它改成 hosts: local 也不会报警。
+    """
+    names = []
+    for section in ("pre_tasks", "tasks", "post_tasks"):
+        for task in as_list(play.get(section)):
+            if not isinstance(task, dict):
+                continue
+            module, args = module_of(task)
+            if short_module(module) in ("include_role", "import_role") and isinstance(args, dict):
+                name = str(args.get("name", "")).strip()
+                if name:
+                    names.append(name)
+    return names
+
+
 def check_playbook(path: pathlib.Path, group_hosts, report: Report) -> list[tuple[str, set[str], bool]]:
     """校验一个 playbook。返回 [(role 名, role 继承的门控表达式, 该 play 是否可能含本地主机)]。"""
     data = load_yaml(path)
@@ -682,7 +707,11 @@ def check_playbook(path: pathlib.Path, group_hosts, report: Report) -> list[tupl
                 hosts_text = str(play.get("hosts", "")).strip()
                 if hosts_text != LOCAL_GROUP and hosts_text != "all":
                     pass  # local / all 都可以，但下面会检查 role 是否 cloud-only
-                cloud_only_used = [r for r in roles if r in CLOUD_ONLY_ROLES]
+                # tasks 里 import_role 引入的也算「这个 play 引用了它」——
+                # 否则把 cloud-only role 挪进 hosts: local 的 play 也不会报警
+                cloud_only_used = sorted(
+                    (set(roles) | set(role_names_in_tasks(play))) & CLOUD_ONLY_ROLES
+                )
                 if cloud_only_used:
                     report.error(
                         where,
@@ -758,6 +787,18 @@ def collect_role_gates_from_includes(root: pathlib.Path, role: str, report: Repo
             if short_module(module) in ("include_tasks", "import_tasks") and isinstance(args, str):
                 target = path.parent / args
                 walk(target, own_gates, seen)
+
+            # ★ 跟到 import_role / include_role 的 tasks_from 里。
+            #   这是 P6 最后一条旁路：role 的 main.yml 每个 role 都会单独遍历，
+            #   但 tasks_from: rollback 指向的是**另一份文件**，它里面的写操作
+            #   （把 index.html 拷回 public/）从来没进过检查清单。
+            #   只跟非 main 的：main 已经由外层按 role 逐个走到，跟进会重复。
+            if short_module(module) in ("include_role", "import_role") and isinstance(args, dict):
+                target_role = str(args.get("name", "")).strip()
+                tasks_from = str(args.get("tasks_from", "main")).strip() or "main"
+                if target_role and tasks_from != "main":
+                    walk(root / "roles" / target_role / "tasks" / f"{tasks_from}.yml",
+                         own_gates, seen)
 
     walk(tasks_dir / "main.yml", set(), set())
     return results
@@ -1011,6 +1052,50 @@ def selftest() -> int:
         "cloud-only",
         True,
     ))
+    # ---- P5 的旁路：cloud-only role 藏在 tasks 的 import_role 里 ----
+    #    tasks_from 只能写在 import_role 上（roles 列表的 dict 写法会被静默忽略），
+    #    所以这种入口天然会把 role 挪出 roles: 列表 ——
+    #    只扫 roles: 的规则在这里会完全失明（真实入口就是 playbooks/rollback.yml）。
+    cases.append((
+        "cloud-only role 只出现在 tasks 的 import_role 里",
+        {
+            "name": "x",
+            "hosts": LOCAL_GROUP,
+            "intent": "mutate",
+            "pre_tasks": [{
+                "name": "gate",
+                "ansible.builtin.meta": "end_play",
+                "when": "not (local_mutation_allowed | default(false) | bool)",
+            }],
+            "roles": ["guard"],
+            "tasks": [{
+                "name": "回滚",
+                "ansible.builtin.import_role": {"name": "app_stack", "tasks_from": "rollback"},
+            }],
+        },
+        "cloud-only",
+        True,
+    ))
+    cases.append((
+        "tasks 的 import_role 引入的是普通 role —— 应放行",
+        {
+            "name": "x",
+            "hosts": LOCAL_GROUP,
+            "intent": "mutate",
+            "pre_tasks": [{
+                "name": "gate",
+                "ansible.builtin.meta": "end_play",
+                "when": "not (local_mutation_allowed | default(false) | bool)",
+            }],
+            "roles": ["guard"],
+            "tasks": [{
+                "name": "补基线",
+                "ansible.builtin.import_role": {"name": "baseline", "tasks_from": "extra"},
+            }],
+        },
+        "",
+        False,
+    ))
     # ---- 正常：只读 play ----
     cases.append((
         "只读 play（hosts: all + intent: read）—— 应该放行",
@@ -1099,6 +1184,42 @@ def selftest() -> int:
     # 这一条是补出来的：真实踩过一次「校验全绿、Ansible 却看不到变量」。
     import tempfile
 
+    # ---- P6 的旁路：tasks_from 指向的那份文件也必须被遍历到 ----
+    #    真实形态就是 roles/app_stack/tasks/rollback.yml —— 它里面有两个 copy
+    #    （把产物拷回 public/、改 current 指针），而它只能靠
+    #    import_role(name=app_stack, tasks_from: rollback) 进入。
+    #    遍历不跟进 tasks_from 的话，这份文件对 P6 来说完全不存在：
+    #    再往里写什么都检查不到。
+    print()
+    print("  role 内 tasks_from 的跟进：")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = pathlib.Path(tmp)
+        fake_tasks = fake / "roles" / "demo" / "tasks"
+        fake_tasks.mkdir(parents=True)
+        (fake_tasks / "main.yml").write_text(
+            "- name: 入口\n"
+            "  ansible.builtin.import_role:\n"
+            "    name: demo\n"
+            "    tasks_from: side\n",
+            encoding="utf-8",
+        )
+        (fake_tasks / "side.yml").write_text(
+            "- name: 偷偷改配置\n"
+            "  ansible.builtin.template:\n"
+            "    src: a.j2\n"
+            "    dest: /etc/a.conf\n",
+            encoding="utf-8",
+        )
+        sub = Report()
+        entries = collect_role_gates_from_includes(fake, "demo", sub)
+        names = {str(task.get("name", "")) for _, _, task, _ in entries}
+        ok = "偷偷改配置" in names
+        print(f"  {'✓' if ok else '✗'} side.yml 里的写任务被遍历到了"
+              f"（实得：{'遍历到了' if ok else '没遍历到'}）")
+        if not ok:
+            failures += 1
+
     print()
     print("  group_vars 位置检查：")
 
@@ -1186,7 +1307,9 @@ def check_playbook_core(rel: str, play: dict, group_hosts, report: Report) -> No
     may_local = play_hosts_may_include_local(play.get("hosts"), group_hosts, report, where)
     if may_local and intent == "mutate":
         if has_local_unlock_gate(play):
-            cloud_only_used = [r for r in roles if r in CLOUD_ONLY_ROLES]
+            cloud_only_used = sorted(
+                (set(roles) | set(role_names_in_tasks(play))) & CLOUD_ONLY_ROLES
+            )
             if cloud_only_used:
                 report.error(where, f"解锁型 play 引用了 cloud-only role：{', '.join(cloud_only_used)}", "")
         else:

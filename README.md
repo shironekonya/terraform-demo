@@ -15,8 +15,12 @@
   全程幂等，变更后自带自检。
 - **两者互不干涉**：Terraform 不调用 Ansible，Ansible 不调 `terraform output`，跨层数据只经 CI artifact 或声明文件传递。
   这条边界连同另外八条一起写进 [`boundaries.yml`](boundaries.yml)，由 `tools/check_boundaries.py` 静态检查。
-- **下一步**：接入本地 CI 编排，让 `.gitlab-ci.yml` 成为环境变更的唯一入口
-  （`validate → plan → apply（人工放行）→ configure → verify`，`apply` 用的是 `plan` 产出的那份计划文件）。
+- **CI 是变更的唯一入口**：`.gitlab-ci.yml` 把「谁、什么时候、以什么为准去改环境」收敛成一条路径
+  —— `git push` → 流水线。七个阶段：`validate → plan → apply（人工放行）→ configure → verify → rollback → teardown`。
+  Terraform 与 Ansible 在流水线里是两个**独立 job**，数据只经 artifact 传递；
+  `apply` 执行的是 `plan` 产出的那份计划文件，不是重新算一遍 —— 流水线里被看过的那份，就是被执行的那份。
+  **发布与回滚都在这里**：`configure:cloud` 把 `$CI_COMMIT_SHORT_SHA` 当版本名发布，
+  `rollback:app` 是个 manual job，按 `releases/<版本>/` 里的产物退回上一版或指定版本。
 
 ## 2. 整体逻辑
 
@@ -24,18 +28,38 @@
 
 ## 3. 错误总结
 
-见 [`PITFALLS.md`](PITFALLS.md)：49 条实践踩坑，按轮次分组、带索引，每条对应一种真实的失败模式。
+见 [`PITFALLS.md`](PITFALLS.md)：53 条实践踩坑，按轮次分组、带索引，每条对应一种真实的失败模式。
 
 ---
+
+## 接流水线（本地 GitLab）
+
+Runner 装在**已经有工具链的那台**（本项目是 `192.168.193.147`：terraform + ansible + ECS 私钥），
+用 shell executor——`.gitlab-ci.yml` 里的 job 靠 `tags: [wf-infra]` 找到它。
+
+```bash
+sudo GITLAB_URL=http://192.168.193.139:8000 \
+     RUNNER_TOKEN=glrt-xxxxxxxxxxxx \
+     ./tools/install_runner.sh
+```
+
+然后三件必须在 GitLab 侧做的事：Runner 变绿（online，tag=`wf-infra`）、
+配 CI/CD Variables（`ALICLOUD_ACCESS_KEY` / `ALICLOUD_SECRET_KEY` Masked、`WF_SSH_KEY_FILE` File 类型）、
+该机器上的工作区保持干净（shell executor 直接在 `$CI_PROJECT_DIR` 里跑）。
+
+完整的取舍（为什么是 shell 而不是 docker executor、为什么 `concurrent = 1`、
+为什么 runner 不上 GitLab 那台）写在 [`LOGIC.md`](LOGIC.md)。
 
 ## 复核
 
 ```bash
 python3 tools/check_boundaries.py             # 九条边界逐条检查
-python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65 个用例
+python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：67 个用例
 ```
 
 检查器只用 Python 标准库，不连云、不连机器、不装依赖，任何机器上都能复现同一结果。
+
+Ansible 侧另有一套离线护栏与自证（166 项断言），跑法见 [`LOGIC.md`](LOGIC.md)。
 
 ## 注意
 

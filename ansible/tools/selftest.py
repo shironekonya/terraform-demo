@@ -452,6 +452,9 @@ def test_stack_templates() -> None:
         "wf_stack_image": "nginx:alpine",
         "wf_stack_port": 8080,
         "wf_stack_dir": "/opt/wf/stacks/wf-web",
+        "wf_stack_release": "e5e2215",
+        "wf_stack_release_root": "/opt/wf/stacks/wf-web/releases",
+        "wf_stack_public_dir": "/opt/wf/stacks/wf-web/public",
         "ansible_distribution": "Alibaba Cloud Linux",
         "ansible_distribution_version": "3.2104",
         "ansible_kernel": "5.10.134-16.al8.x86_64",
@@ -470,8 +473,12 @@ def test_stack_templates() -> None:
         check("镜像正确", svc.get("image") == "nginx:alpine", svc)
         check("端口只绑回环，不对外（127.0.0.1:8080:80）",
               svc.get("ports") == ["127.0.0.1:8080:80"], svc.get("ports"))
-        check("首页文件以只读挂载", any("index.html" in str(v) and str(v).endswith(":ro")
-                                        for v in svc.get("volumes") or []), svc.get("volumes"))
+        # ★ 挂的必须是**目录**：单文件 bind mount 在容器创建时就把 inode 钉死了，
+        #   之后换内容容器看不到 —— 发布/回滚都会静默失效。这条断言就是钉它的。
+        volumes = [str(v) for v in svc.get("volumes") or []]
+        check("首页以只读挂载，且挂的是目录不是单个文件",
+              any(v.endswith("public:/usr/share/nginx/html:ro") for v in volumes)
+              and not any("index.html" in v for v in volumes), volumes)
         check("带健康检查", "healthcheck" in svc, svc)
         check("刻意不写 version 字段（compose v2 已废弃）", "version" not in (data or {}), list(data or {}))
     except yaml.YAMLError as exc:
@@ -482,11 +489,185 @@ def test_stack_templates() -> None:
     check("首页含地址", "47.98.12.34" in html_out)
     check("首页是完整 HTML", html_out.lstrip().startswith("<!DOCTYPE html>") and "</html>" in html_out)
     check("首页会显示容器名", "wf-web" in html_out)
+    # 版本标记是"发布/回滚有没有真的生效"的唯一可读证据：
+    # 正文里那行给人看，meta 那行给断言用（整串不会和其它内容撞上）。
+    check("首页带版本标记（meta wf-release）",
+          '<meta name="wf-release" content="e5e2215">' in html_out, html_out[:300])
+    check("首页正文里也显示版本", "<dt>版本</dt><dd>e5e2215</dd>" in html_out)
 
     # 关键：不同主机的渲染结果必须不同（否则"批量下发同一份模板"就没意义）
     ctx2 = dict(ctx, inventory_hostname="demo-ecs-2", ansible_host="47.98.56.78")
     html_out2 = env.get_template("roles/app_stack/templates/index.html.j2").render(**ctx2)
     check("两台机器渲染出的首页不同（体现各自身份）", html_out != html_out2)
+
+
+def test_release_rollback() -> None:
+    """发布与回滚：版本必须落在**产物**上，不能落在"再跑一遍"上。
+
+    三个最要命的退化，都发生在没人写下来的地方：
+
+      ① 回滚 = 重跑一遍发布。用当前模板重新渲染一遍，得到的是
+         "旧版本号 + 新内容" —— 名字对了，内容不对，比不回滚更难查。
+      ② 容器挂单个文件。bind mount 在创建容器时把 inode 钉死，
+         之后换宿主机的文件容器读不到 —— 回滚"成功"，页面没变，也没有报错。
+      ③ 没有当前版本指针。"现在跑的是哪一版"只能靠猜，回滚就无从谈起。
+
+    这三条都能在结构上钉死，不需要连机器。运行时行为仍然要真跑才知道。
+    """
+    print("\n[5c] 发布与回滚（版本落在产物上，不是落在再跑一遍上）")
+
+    def load(rel: str):
+        return yaml.safe_load((ROOT / rel).read_text(encoding="utf-8"))
+
+    def flatten(items) -> list[dict]:
+        out: list[dict] = []
+        for task in items or []:
+            if not isinstance(task, dict):
+                continue
+            out.append(task)
+            for key in ("block", "rescue", "always"):
+                out.extend(flatten(task.get(key)))
+        return out
+
+    def named(flat: list[dict], key: str) -> list[dict]:
+        return [t for t in flat if key in str(t.get("name", ""))]
+
+    def args_of(task: dict, module: str) -> dict:
+        value = task.get(module) or {}
+        return value if isinstance(value, dict) else {"cmd": value}
+
+    deploy = flatten(load("roles/app_stack/tasks/main.yml"))
+    rollback = flatten(load("roles/app_stack/tasks/rollback.yml"))
+
+    # ---- 发布侧 -----------------------------------------------------------
+    artifact = named(deploy, "渲染本版首页")
+    artifact_dest = str(args_of(artifact[0], "ansible.builtin.template").get("dest", "")) if artifact else ""
+    check("发布会把渲染结果落到 releases/<版本>/（不可变产物）",
+          bool(artifact) and "wf_stack_release_root" in artifact_dest
+          and "wf_stack_release }}" in artifact_dest, artifact_dest)
+
+    publish = named(deploy, "发布到线上目录")
+    publish_args = args_of(publish[0], "ansible.builtin.copy") if publish else {}
+    check("线上目录是产物的拷贝（remote_src，不从控制端再传一遍）",
+          publish_args.get("remote_src") is True, publish_args)
+    check("拷贝目标是 public/index.html",
+          "wf_stack_public_dir" in str(publish_args.get("dest", ""))
+          and str(publish_args.get("dest", "")).endswith("/index.html"), publish_args.get("dest"))
+
+    current = named(deploy, "记录当前版本")
+    check("部署成功后会写当前版本指针（回滚靠它找前一版）",
+          bool(current) and "wf_stack_release" in str(args_of(current[0], "ansible.builtin.copy").get("content", "")),
+          current[:1])
+
+    history = named(deploy, "记入发布历史")
+    hist_args = args_of(history[0], "ansible.builtin.lineinfile") if history else {}
+    check("历史用 lineinfile 追加（同一版本重复部署不会记两遍）",
+          str(hist_args.get("line", "")).strip() == "{{ wf_stack_release }}", hist_args)
+    check("记账动作以「镜像已就位」为前提（没起来就不算发布过）",
+          bool(current) and "wf_stack_image_ready" in str(current[0].get("when", "")), current[:1])
+
+    verify = named(deploy, "线上页面就是本版")
+    check("发布自检读回页面版本标记（200 只证明通，不证明是哪一版）",
+          bool(verify) and "wf-release" in str(verify[0].get("ansible.builtin.assert", {}).get("that", "")),
+          verify[:1])
+
+    # ---- 回滚侧 -----------------------------------------------------------
+    check("回滚读历史时，历史不存在不算「读失败」而是「还没发布过」",
+          any("slurp" in t.get("ansible.builtin.slurp", {}) or "ansible.builtin.slurp" in t
+              for t in named(rollback, "读发布历史")) and
+          any(t.get("failed_when") is False for t in named(rollback, "读发布历史")),
+          named(rollback, "读发布历史")[:1])
+    check("没有历史时用一句人话拒绝，而不是抛 slurp 原始报错",
+          bool(named(rollback, "没有发布历史")) and
+          "slurp" not in str(named(rollback, "没有发布历史")[0].get("ansible.builtin.fail", {})),
+          named(rollback, "没有发布历史")[:1])
+    check("回滚目标必须落在历史里（防止拼错版本名回退到空）",
+          "in wf_rb_releases" in str(named(rollback, "断言：目标必须是历史里真实存在的一版")[0]
+                                    .get("ansible.builtin.assert", {}).get("that", "")) if
+          named(rollback, "断言：目标必须是历史里真实存在的一版") else False)
+    check("产物缺失时拒绝回滚（不退化成本地重新渲染）",
+          bool(named(rollback, "产物缺失")) and
+          "渲染" in str(named(rollback, "产物缺失")[0].get("ansible.builtin.fail", {}).get("msg", "")),
+          named(rollback, "产物缺失")[:1])
+    check("★ 回滚全程不出现 template 模块（出现就说明又在渲染）",
+          not any("ansible.builtin.template" in t for t in rollback),
+          [t.get("name") for t in rollback if "ansible.builtin.template" in t])
+    check("回滚同时更新内容与指针",
+          bool(named(rollback, "把目标产物发布回线上目录")) and bool(named(rollback, "更新当前版本指针")))
+    check("回滚自检读的是 80 上的版本标记，不是「文件拷过去了」",
+          "wf-release" in str(named(rollback, "页面上的版本标记就是目标版本")[0]
+                              .get("ansible.builtin.assert", {}).get("that", ""))
+          if named(rollback, "页面上的版本标记就是目标版本") else False)
+
+    # ---- 回滚表达式的真值表 ------------------------------------------------
+    # 只验结构不够：挑版本的表达式写错时，结构全对、行为全错。
+    expr = named(rollback, "算出要回退到哪一版")[0].get("ansible.builtin.set_fact", {}).get("wf_rb_target")
+    import jinja2
+
+    env = jinja2.Environment(undefined=jinja2.ChainableUndefined)
+    cases = [
+        ("两版，回退到上一个", ["v1", "v2"], "v2", None, "v1"),
+        ("三版，回退到上一个", ["v1", "v2", "v3"], "v3", None, "v2"),
+        ("当前是第一版 → 没有上一版", ["v1", "v2"], "v1", None, ""),
+        ("只有一版 → 没有上一版", ["v1"], "v1", None, ""),
+        ("指针损坏（不在历史里）→ 退化成倒数第二版", ["v1", "v2"], "ghost", None, "v1"),
+        ("显式指定优先", ["v1", "v2"], "v2", "v1", "v1"),
+    ]
+    for label, releases, current_version, explicit, want in cases:
+        # 不传 wf_rollback_to 时就是"变量不存在"，而不是传一个 None ——
+        # 只测 None 会让 `default()` 的行为看起来和真跑不一样。
+        kwargs = {"wf_rb_releases": releases, "wf_rb_current": current_version}
+        if explicit is not None:
+            kwargs["wf_rollback_to"] = explicit
+        try:
+            got = str(env.from_string(expr).render(**kwargs)).strip()
+        except Exception as exc:  # noqa: BLE001
+            got = f"ERROR {exc}"
+        check(f"挑版本：{label} → {want or '(空)'}", got == want, got)
+
+    # ---- 入口 playbook -----------------------------------------------------
+    play = load("playbooks/rollback.yml")
+    first = (play or [{}])[0]
+    roles = first.get("roles") or []
+    check("rollback.yml：guard 在 roles 第一位", bool(roles) and roles[0] == "guard", roles)
+    check("rollback.yml：intent=mutate（回滚也是写操作）",
+          (first.get("vars") or {}).get("intent") == "mutate", first.get("vars"))
+
+    # ★ tasks_from 只有一个地方能生效：**roles 之外的** import_role/include_role。
+    #   roles: 列表的 dict 写法（- role: app_stack / tasks_from: rollback）
+    #   会被 Ansible 静默忽略、照跑 main.yml —— 于是"回滚"变成了"又发布一次"，
+    #   而且不报任何错（PITFALLS 第 52 条）。所以这里断言两件事：
+    #     ① 入口确实是用 import_role 带的 tasks_from
+    #     ② roles 列表里全是字符串，没有混进 dict 写法
+    task_block = [t for t in (first.get("tasks") or []) if isinstance(t, dict)]
+
+    def _role_entry(task: dict) -> dict:
+        for key in ("ansible.builtin.import_role", "import_role",
+                    "ansible.builtin.include_role", "include_role"):
+            value = task.get(key)
+            if isinstance(value, dict):
+                return value
+        return {}
+
+    loaded = [(str(e.get("name") or ""), str(e.get("tasks_from") or "main"))
+              for e in map(_role_entry, task_block) if e]
+    check("rollback.yml：用 import_role 载入 app_stack 的 rollback 任务（路径定义只有一份）",
+          ("app_stack", "rollback") in loaded, loaded)
+    check("rollback.yml：roles 列表里没有 dict 写法（tasks_from 会被静默忽略）",
+          all(isinstance(r, str) for r in roles), roles)
+
+    # ---- CI 入口 -----------------------------------------------------------
+    ci = yaml.safe_load((ROOT.parent / ".gitlab-ci.yml").read_text(encoding="utf-8"))
+    check("CI 有独立的 rollback 阶段", "rollback" in (ci.get("stages") or []), ci.get("stages"))
+    job = ci.get("rollback:app") or {}
+    check("rollback:app 是人工放行", any(r.get("when") == "manual" for r in job.get("rules") or []),
+          job.get("rules"))
+    check("rollback:app 调的是 playbooks/rollback.yml",
+          any("playbooks/rollback.yml" in str(line) for line in job.get("script") or []), job.get("script"))
+    check("部署 job 会把 commit 当版本名传下去",
+          any("wf_release=$CI_COMMIT_SHORT_SHA" in str(line)
+              for line in (ci.get("configure:cloud") or {}).get("script") or []),
+          (ci.get("configure:cloud") or {}).get("script"))
 
 
 def test_image_preflight() -> None:
@@ -986,6 +1167,7 @@ def main() -> int:
     test_audit_report()
     test_daemon_json()
     test_stack_templates()
+    test_release_rollback()
     test_front_door_template()
     test_image_preflight()
     test_baseline_templates()

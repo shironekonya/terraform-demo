@@ -52,6 +52,7 @@ stages:
   - apply
   - configure
   - verify
+  - rollback
   - teardown
 
 variables:
@@ -65,9 +66,32 @@ variables:
 
 default:
   tags:
+    # ★ 这个 tag 必须和注册 runner 时的 --tag-list 一致。
+    #   不一致时 job 不会报错，只会灰着一直转、状态写成 stuck ——
+    #   因为它既不失败也不超时。tools/check_boundaries.py 的 B7 盯着这一条。
     - wf-infra
   before_script:
     - set -eo pipefail
+    - |
+      # ── 工具链自检 ──────────────────────────────────────────────
+      # shell executor **不继承登录 shell 的 PATH**，它只用 config.toml
+      # 里 environment 写的那一份。漏写一个目录，症状就是 job 第一行
+      # `command not found` 然后变红 —— 而流水线不会告诉你这是 PATH 的事。
+      # 所以先花三行把它问清楚，比事后猜要好。
+      missing=0
+      for tool in python3 terraform ansible-playbook; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+          echo "✗ runner 上找不到 $tool"
+          missing=1
+        fi
+      done
+      if [ "$missing" -ne 0 ]; then
+        echo
+        echo "  修法：把它所在目录写进 /etc/gitlab-runner/config.toml 的"
+        echo "        environment = [\"PATH=...\"]，然后 systemctl restart gitlab-runner。"
+        echo "        tools/install_runner.sh 会探测并写好 —— 手动登记的 runner 最容易漏。"
+        exit 1
+      fi
 
 # 避免 push 和 MR 各触发一条流水线（GitLab 的老问题）
 workflow:
@@ -169,7 +193,10 @@ configure:cloud:
   script:
     - cd "$ANSIBLE_ROOT"
     - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE"
-    - ansible-playbook playbooks/site.yml --limit cloud
+    # ★ 版本名 = 这个 commit。它会被写进页面、写进 releases/<版本>/、写进 current。
+    #   回滚靠的就是这一串：不传版本名时，两次部署在机器上长得一模一样，
+    #   没法回答"现在跑的是哪一版、上一版还在不在"。
+    - ansible-playbook playbooks/site.yml --limit cloud -e "wf_release=$CI_COMMIT_SHORT_SHA"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
@@ -211,7 +238,39 @@ verify:readonly:
     - echo "验收性质：上面这条的 changed 必须是 0。不为 0 说明有东西没收敛。"
 
 # ---------------------------------------------------------------------------
-# 6. teardown：最危险的动作，同样走人工放行
+# 6. rollback：把应用退回上一版
+#
+#   和 teardown 分开放，是因为它们回答的是两个问题：
+#     rollback  应用出错 → 退回上一版（机器还在，30 秒的事）
+#     teardown  整组资源不要了 → destroy（不可逆，要重新 apply 才能回来）
+#
+#   仍然是人工放行：回滚本身也是一次变更，不该由"谁推了个 commit"决定。
+#   不填 WF_ROLLBACK_TO 时，回退到当前版本的上一个。
+# ---------------------------------------------------------------------------
+
+rollback:app:
+  stage: rollback
+  needs:
+    - job: plan
+      artifacts: true
+  script:
+    - cd "$ANSIBLE_ROOT"
+    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE" --quiet
+    - |
+      if [ -n "${WF_ROLLBACK_TO:-}" ]; then
+        echo "指定回退到：$WF_ROLLBACK_TO"
+        ansible-playbook playbooks/rollback.yml --limit cloud -e "wf_rollback_to=$WF_ROLLBACK_TO"
+      else
+        echo "未指定目标 → 回退到当前版本的上一个"
+        ansible-playbook playbooks/rollback.yml --limit cloud
+      fi
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: false
+
+# ---------------------------------------------------------------------------
+# 7. teardown：最危险的动作，同样走人工放行
 #    （放在最后一段，是为了让它在流水线界面上永远要你主动去点）
 # ---------------------------------------------------------------------------
 

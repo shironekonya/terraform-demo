@@ -1,0 +1,161 @@
+---
+# ===========================================================================
+# app_stack / rollback —— 把线上目录指回历史里的另一版
+#
+# 入口只有一个：playbooks/rollback.yml（roles: [guard, {app_stack, tasks_from: rollback}]）
+#
+# 为什么回滚要单独一份任务，而不是"再跑一遍 main.yml -e wf_release=旧版本"：
+#
+#   main.yml 会用**当前模板**重新渲染。如果模板本身改过（这正是最需要回滚的场景），
+#   重新渲染出来的内容是新的，只是版本号写成了旧的 —— 名字对了，内容不对。
+#   所以回滚只能发生在**产物**上：releases/<release>/ 是那次发布留下的原件，
+#   把原件拷回去，才是真的回到那一版。
+#
+# 这个文件不做任何渲染，只做三件事：挑版本 → 拷产物 → 验页面。
+# ===========================================================================
+
+- name: "回滚 · 读发布历史（只读）"
+  ansible.builtin.slurp:
+    src: "{{ wf_stack_history }}"
+  register: wf_rb_hist_raw
+  # 历史不存在是"还没发布过"，不是"读失败" —— 下面用一句人话拒绝，
+  # 而不是抛一个 slurp 的报错让人去猜路径。
+  failed_when: false
+
+- name: "回滚 · 没有发布历史 → 拒绝"
+  ansible.builtin.fail:
+    msg: |
+      ⛔ {{ inventory_hostname }} 上没有 {{ wf_stack_history }}。
+
+      这台机器还没通过 playbook 发布过，"上一版"不存在，也就无从回退。
+      先做一次正常发布（会顺带写下历史）：
+
+        ansible-playbook playbooks/site.yml --limit cloud -e wf_release=<版本名>
+  when: wf_rb_hist_raw.content is not defined
+
+- name: "回滚 · 读当前版本指针（只读）"
+  ansible.builtin.slurp:
+    src: "{{ wf_stack_current_file }}"
+  register: wf_rb_current_raw
+  failed_when: false
+
+- name: "回滚 · 解析历史与当前版本"
+  ansible.builtin.set_fact:
+    # 历史是"一行一个版本"，顺序即发布顺序。空行与空白一并丢掉。
+    wf_rb_releases: >-
+      {{ (wf_rb_hist_raw.content | b64decode).splitlines()
+         | map('trim') | reject('equalto', '') | list }}
+    wf_rb_current: >-
+      {{ ((wf_rb_current_raw.content | b64decode) | trim)
+         if (wf_rb_current_raw.content is defined) else '' }}
+
+# ---------------------------------------------------------------------------
+# 挑版本
+#   ① 显式指定 -e wf_rollback_to=xxx 优先
+#   ② 否则取"当前版本的上一行"（历史是有序的，前一行就是上一版）
+#   ③ 当前版本不在历史里（比如指针是手改的）→ 退化成"倒数第二版"
+# ---------------------------------------------------------------------------
+- name: "回滚 · 算出要回退到哪一版"
+  ansible.builtin.set_fact:
+    wf_rb_target: >-
+      {{ (wf_rollback_to | default('', true) | trim)
+         or (wf_rb_releases[wf_rb_releases.index(wf_rb_current) - 1]
+             if (wf_rb_current in wf_rb_releases
+                 and wf_rb_releases.index(wf_rb_current) > 0)
+             else ('' if (wf_rb_current in wf_rb_releases)
+                   else (wf_rb_releases[-2] if (wf_rb_releases | length) > 1 else ''))) }}
+
+- name: "回滚 · 断言：目标必须是历史里真实存在的一版"
+  ansible.builtin.assert:
+    that:
+      - (wf_rb_target | length) > 0
+      - wf_rb_target in wf_rb_releases
+    fail_msg: |
+      ⛔ 找不到可以回退的版本。
+
+      当前版本：{{ wf_rb_current if (wf_rb_current | length) > 0 else '(未知)' }}
+      历史版本：{{ wf_rb_releases | join(' → ') }}
+      {% if (wf_rollback_to | default('') | length) > 0 %}
+      你指定的目标 "{{ wf_rollback_to }}" 不在历史里。
+      {% else %}
+      历史里只有一版 —— 没有"上一版"可回。
+      {% endif %}
+
+      用法：-e wf_rollback_to=<上面任意一个版本>
+    quiet: true
+
+- name: "回滚 · 确认目标版本的产物还在（只读）"
+  ansible.builtin.stat:
+    path: "{{ wf_stack_release_root }}/{{ wf_rb_target }}/index.html"
+  register: wf_rb_artifact
+
+- name: "回滚 · 产物缺失 → 拒绝（不重新渲染）"
+  ansible.builtin.fail:
+    msg: |
+      ⛔ 历史里有 {{ wf_rb_target }}，但产物不在了：
+         {{ wf_stack_release_root }}/{{ wf_rb_target }}/index.html
+
+      这里刻意**不**退化成"用当前模板重新渲染一份" ——
+      那会得到"旧版本号 + 新内容"，比不回滚更难排查。
+      要么找回归档的产物，要么把这次回滚当成一次正常发布来做（改模板 → 发新版）。
+  when: not wf_rb_artifact.stat.exists
+
+- name: "回滚 · 把目标产物发布回线上目录"
+  ansible.builtin.copy:
+    src: "{{ wf_stack_release_root }}/{{ wf_rb_target }}/index.html"
+    dest: "{{ wf_stack_public_dir }}/index.html"
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0644"
+  register: wf_rb_copy
+
+# 指针要跟着内容一起改：只改内容不改指针，下次部署会以为线上还是旧版。
+- name: "回滚 · 更新当前版本指针"
+  ansible.builtin.copy:
+    content: "{{ wf_rb_target }}\n"
+    dest: "{{ wf_stack_current_file }}"
+    owner: root
+    group: root
+    mode: "0644"
+
+# ---------------------------------------------------------------------------
+# 自检：不验"文件拷过去了"，验"从 80 上读到的就是那一版"
+# 容器挂的是目录，所以不需要重启容器 —— 这一步同时证明了这一点。
+# ---------------------------------------------------------------------------
+- name: "回滚 · 从 80 读回页面"
+  ansible.builtin.uri:
+    url: "http://127.0.0.1/"
+    status_code: 200
+    return_content: true
+    timeout: 5
+  register: wf_rb_check
+  changed_when: false
+  retries: 5
+  delay: 2
+  until: wf_rb_check.status | default(0) == 200
+  when: not ansible_check_mode
+
+- name: "回滚 · 断言：页面上的版本标记就是目标版本"
+  ansible.builtin.assert:
+    that:
+      - ('<meta name="wf-release" content="' ~ wf_rb_target ~ '">') in (wf_rb_check.content | default(''))
+    fail_msg: |
+      ⛔ 文件已经换回 {{ wf_rb_target }}，但从 80 读到的页面不是这一版。
+
+      最可能的原因：容器挂的还是**单个文件**（旧版 compose），
+      单文件 bind mount 把 inode 钉死了，换宿主机的内容容器看不到。
+      复核：
+        grep -A2 volumes {{ wf_stack_dir }}/docker-compose.yml
+        docker exec {{ wf_stack_name }} cat /usr/share/nginx/html/index.html | grep wf-release
+      修法：重跑一次 site.yml（会把 compose 换成目录挂载并重建容器）。
+    quiet: true
+  when: not ansible_check_mode
+
+- name: "回滚 · 结果"
+  ansible.builtin.debug:
+    msg:
+      - "回滚          : {{ wf_rb_current if (wf_rb_current | length) > 0 else '(未知)' }} → {{ wf_rb_target }}"
+      - "线上目录      : {{ wf_stack_public_dir }}/index.html（{{ '内容已换' if wf_rb_copy is changed else '内容本来就一致，无需替换' }}）"
+      - "容器          : 未重启（挂的是目录，按路径读，换文件即生效）"
+      - "版本历史      : {{ wf_rb_releases | join(' → ') }}"
