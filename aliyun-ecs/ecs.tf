@@ -62,7 +62,15 @@ resource "alicloud_instance" "web" {
       yum install -y nginx
     fi
     systemctl enable --now nginx
-    echo "hello from ${each.key} - created by Terraform" > /usr/share/nginx/html/index.html
+    # ★ 两种发行版的默认站点根目录不同：Debian/Ubuntu 是 /var/www/html，
+    #   RHEL 系（含 Alibaba Cloud Linux）是 /usr/share/nginx/html。
+    #   只写一个路径的话，另一种发行版上打开 80 看到的是发行版自带欢迎页，
+    #   而「看到 hello from ...」正是这一层的验收判据 —— 它会变成假通过。
+    page="hello from ${each.key} - created by Terraform"
+    for d in /var/www/html /usr/share/nginx/html; do
+      mkdir -p "$d"
+      printf '%s\n' "$page" > "$d/index.html"
+    done
   EOT
 
   tags = merge(local.common_tags, {

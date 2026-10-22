@@ -88,21 +88,22 @@ resource "alicloud_security_group_rule" "https" {
   description       = "HTTPS"
 }
 
-# 容器栈端口
-# Ansible 的 app_stack role 把主机 wf_stack_port（默认 8080）映射到容器 80。
-# 80 已经被 user_data 装的系统 nginx 占用，所以栈刻意错开 —— 两处端口必须一起看：
-# 这里是安全组，ansible/inventory/group_vars/cloud.yml 里是 wf_stack_port。
-resource "alicloud_security_group_rule" "app_stack" {
-  type              = "ingress"
-  ip_protocol       = "tcp"
-  nic_type          = "intranet"
-  policy            = "accept"
-  port_range        = "${var.app_stack_port}/${var.app_stack_port}"
-  priority          = 11
-  security_group_id = alicloud_security_group.web.id
-  cidr_ip           = "0.0.0.0/0"
-  description       = "app_stack"
-}
+# 容器栈端口不再单独放行
+#
+# 以前这里有第五条规则（默认 8080），因为 app_stack 把宿主机 8080 映射到容器 80，
+# 而 80 已经被 user_data 装的系统 nginx 占着。结果是**两个公网入口**：
+# 80 给一张静态页，8080 给真正的应用 —— 同一台机器两副面孔。
+#
+# 现在改成一个入口：
+#   80   系统 nginx（user_data 装的），反代到 127.0.0.1:<wf_stack_port>
+#   8080 容器栈，只绑回环（ansible/roles/app_stack/templates/docker-compose.yml.j2）
+#
+# 于是安全组不需要知道容器端口。这也是这条规则被删掉、而不是改成别的端口的原因：
+# **不需要被外面访问的端口，就不该出现在安全组里。**
+#
+# ★ 若你确实想临时直连容器排查，用 SSH 隧道，不要回头放开安全组：
+#     ssh -L 8080:127.0.0.1:8080 root@<公网IP>
+#   这样端口只在你的机器上可见，公网上始终没有它。
 
 # ICMP：方便 ping 排障
 resource "alicloud_security_group_rule" "icmp" {

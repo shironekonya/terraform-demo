@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------------
+# /etc/nginx/nginx.conf —— 由 Ansible 渲染（roles/app_stack）★ 整份接管
+#
+# 为什么不改发行版自带的配置片段，而是整份替换：
+#   Ubuntu 的默认 server 写在 /etc/nginx/sites-enabled/default，
+#   RHEL 系（含 Alibaba Cloud Linux）的默认 server 直接内联在 nginx.conf 里。
+#   两种发行版、两个位置、两种改法 —— 只要有一处没改干净，就会出现
+#   「两个 default_server 抢 80」或者「我们的 server 根本没被选中」。
+#   后者尤其糟：nginx -t 通过、服务正常、页面却是旧的，**静默失效**。
+#
+#   所以这里选一条对所有发行版都一样的行为：这份文件就是全部配置。
+#   不再 include sites-enabled / conf.d —— 发行版默认站点因此自然失效，
+#   没有"删符号链接"或"注释掉内联块"这类按发行版分支的脆弱操作。
+#
+# 谁负责什么：
+#   80       系统 nginx（本文件）—— 唯一的公网入口
+#   8080     容器栈，只绑 127.0.0.1（见 docker-compose.yml.j2）
+#   端口值   只有一处定义：wf_stack_port（defaults/main.yml）
+# ---------------------------------------------------------------------------
+user  {{ wf_nginx_user }};
+worker_processes  auto;
+
+error_log  /var/log/nginx/error.log warn;
+pid        /run/nginx.pid;
+
+events {
+    worker_connections  1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                      '$status $body_bytes_sent "$http_referer" '
+                      '"$http_user_agent"';
+
+    access_log  /var/log/nginx/access.log  main;
+
+    sendfile        on;
+    keepalive_timeout  65;
+
+    gzip              on;
+    gzip_types        text/plain text/css application/json application/javascript text/xml application/xml;
+    gzip_min_length   1024;
+
+    # -----------------------------------------------------------------------
+    # 唯一对外站点：80 → 本机容器栈
+    # -----------------------------------------------------------------------
+    server {
+        listen       80 default_server;
+        server_name  _;
+
+        # 容器还没起 / 已经挂了时展示的页面。internal 表示只能由本文件内部
+        # 跳转（error_page）访问，外部直接请求 /_wf-pending.html 会被拒绝 ——
+        # 否则它会变成一个"看起来像首页"的孤儿页面。
+        location = /_wf-pending.html {
+            root      {{ wf_front_dir }};
+            internal;
+        }
+
+        location / {
+            proxy_pass         http://127.0.0.1:{{ wf_stack_port }};
+            proxy_http_version 1.1;
+
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+
+            # 上游没起来时别让浏览器干等 60 秒 —— 2 秒就转去给待部署页。
+            proxy_connect_timeout 2s;
+            proxy_read_timeout    60s;
+            proxy_send_timeout    60s;
+
+            # 状态码保持 502/503/504 不变：页面是给人看的，状态码是给监控看的。
+            # 把状态改写成 200 会让人误以为服务健康。
+            error_page 502 503 504 /_wf-pending.html;
+        }
+    }
+}

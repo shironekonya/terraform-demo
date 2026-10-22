@@ -655,6 +655,7 @@ terraform providers lock -platform=windows_amd64 -platform=linux_amd64
 
 - `terraform output` 打印出 `instance_public_ips`；
 - 访问该公网 IP 能看到 nginx 欢迎页（`user_data` 写入的那行文字），说明实例确实起来了；
+  等 Ansible 跑过之后，同一个地址会换成容器栈的页面（见下面的「一个入口」）；
 - `apply` 之后 `terraform plan` 显示无变化 —— 否则说明有资源没进 state。
 
 收尾是 `terraform destroy`，之后**再看一眼 `terraform plan`**：它应为空。
@@ -711,11 +712,71 @@ GitLab 要放行私有网段回调（`gitlab_allow_local_requests`，默认已�
 |---|---|
 | VPC | 网段默认 `10.10.0.0/16` |
 | vSwitch | 默认 `10.10.1.0/24`，可用区自动选择 |
-| 安全组 | 开放 22 / 80 / 443，VPC 内 ICMP |
+| 安全组 | 开放 22 / 80 / 443，VPC 内 ICMP。**容器端口不在里面** —— 它只绑回环，走 80 反代 |
 | ECS | 默认 1 台（可调到 10 台），经济型规格，**按量付费** |
 | 密钥对 | 传了公钥才创建 |
 
 实例创建时会通过 `user_data` 自动装 nginx 并写入一行欢迎页，开机后直接访问公网 IP 就能看到结果，方便验证。
+
+### 一个入口：80 反代到容器栈
+
+这台机器上有**两个** nginx 进程，但**只有一个公网入口**：
+
+| | 系统 nginx | 容器里的 nginx |
+|---|---|---|
+| 装它的 | `user_data`（cloud-init，开机一次） | `roles/app_stack`（compose） |
+| 听哪里 | `0.0.0.0:80` | `127.0.0.1:8080` —— **只绑回环** |
+| 谁配的 | Terraform 的启动脚本 | Ansible 渲染 `nginx.conf` 后反代过去 |
+| 作用 | 公网唯一入口；上游没起来时给一张"待部署页" | 真正的应用页面 |
+
+为什么这么分：
+
+- **80 不能空着**。`apply` 刚结束、Ansible 还没跑的时候，得有一个"机器活着"的证据 ——
+  它不能依赖 SSH、不能依赖 Docker，否则排障时你没法区分"机器没起来"和"配置没跑通"。
+  这个证据就是系统 nginx 那张页。
+- **容器也不能直接对外**。之前给 8080 单独开过一条安全组规则，结果是同一台机器有两副面孔：
+  80 一张静态页、8080 真正的应用。现在容器只绑 `127.0.0.1`，安全组里干脆没有这个端口 ——
+  **不需要被外面访问的端口，就不该出现在安全组里**。
+- **反代配置归 Ansible，不归 user_data**。Terraform 管"资源是否存在"，
+  Ansible 管"机器内部服务怎么配"。把 `proxy_pass` 写进 `user_data` 等于让 Terraform 去管服务状态，
+  而且 `ignore_changes = [user_data]` 会让改了对存量机器不生效 —— 又是一处"改了但没生效"。
+
+落地在 `roles/app_stack`：渲染 `/etc/nginx/nginx.conf`（`validate: nginx -t -c %s`，
+语法不过就不落盘，旧配置原样保留）→ reload → 从本机 `curl 127.0.0.1` 断言拿到 200。
+渲染后的配置不再 `include` 发行版的 `sites-enabled` / `conf.d`，避免两个 `default_server` 抢 80。
+
+
+### 镜像就位：先拿物料，再谈编排
+
+`app_stack` 不会让 `docker compose up -d` 顺手去拉镜像。顺序是：
+
+| 步 | 做什么 | 失败时 |
+|---|---|---|
+| 1 | `docker image inspect` 看本机有没有 | 进下一步 |
+| 2a | 给了 `wf_stack_image_tar` → 上传 → `docker load` → 删临时包 | 记下来，不中断 |
+| 2b | 没给 → `timeout <N> docker pull` | 记 stderr，不中断 |
+| 3 | `up -d`，**以「镜像已就位」为硬门槛** | 不会发生 |
+
+拉不到时，80 仍然按上面的方式配好（给待部署页），最后整幕以 `fail` 收场 ——
+机器是活的，但部署没完成。这样「网络拿不到镜像」和「机器没配上」不会混成同一个现象，
+而且错误信息里能直接写出三条路（加速器 / 离线包 / 换镜像）。
+
+这里有一处容易被写错的细节：**「镜像没拿到」不等于「80 一定 5xx」。**
+新的起不来，旧容器不会自己停 —— 于是 80 可能仍然返回 200。
+所以这条自检接受 `200 / 502 / 503 / 504` 四种状态，再按内容分开判：
+
+| 80 的状态 | 含义 | 处理 |
+|---|---|---|
+| 200 | 旧容器还在服务（降级但可用） | 记成「是旧容器在服务」，不拦 |
+| 502 / 503 / 504，内容是待部署页 | 上游真死了，兜底页生效 | 通过 |
+| 5xx，但内容是 nginx 默认错误页 | `error_page` 没生效 | 断言失败，指出改哪儿 |
+
+只允许 5xx 的写法会让 uri 模块在第一种情况下自己报错，
+把「镜像没拿到」这条真正的失败原因盖掉（见 [踩坑 49](PITFALLS.md)）。
+
+`registry-mirrors` 配了却仍然超时的经典原因是：`daemon.json` 只在**启动时**读一次。
+所以 `docker_engine` 写完会 `flush_handlers` 重启 docker，再断言 `docker info` 里
+真的出现了这条地址 —— 文件是"我以为的状态"，守护进程才是"它实际的样子"。
 
 ### 操作步骤
 
@@ -1296,7 +1357,7 @@ ansible-playbook playbooks/site.yml -e local_mutation_allowed=true -e local_over
 | A | `all` | `read` | 只读体检，报告写到**控制端** `reports/` |
 | B | `local` | `read` | 本地机器的基线**检测**（差什么看得见，但什么都不改） |
 | C | `cloud` | `mutate` | 云机器基线 + Docker 引擎 |
-| D | `cloud` | `mutate` | 云机器：拉起容器栈 |
+| D | `cloud` | `mutate` | 云机器：拉起容器栈（只绑回环）+ 把 80 反代过去 |
 | E | `local` | `mutate` | 本地机器变更 —— **默认整幕不执行**，`pre_tasks` 里第一个任务就是 `meta: end_play` |
 
 幕 E 的写法值得解释一句。它照常声明 `intent: mutate`（于是 `guard` 一定会检查它），
@@ -1615,7 +1676,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 （在一台 Ubuntu 26.04 / ansible-core 2.21.4 的 Linux 机器上完整跑过五幕，
 用 WSL 主机同时扮演 `cloud` 组和 `local` 组的受管机）。
 
-#### 第一段：静态 + 离线（103 项断言 + 13 个校验器自证用例，全部通过）
+#### 第一段：静态 + 离线（136 项断言 + 13 个校验器自证用例，全部通过）
 
 | 验证项 | 做法 | 结果 |
 |---|---|---|
@@ -1628,7 +1689,8 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | **playbook 里的 shell 串过得了 Jinja** | 抽出所有 `shell` / `command` / `script` body 逐个 `env.parse()`（13 项断言） | ✓ 包括反向验证（字面 `{{ }}` 必须报错）和假阳性守卫（单花括号、`{{ var }}` 不误报） |
 | **路径过滤器（禁区判定）** | 9 个用例，含 `-OLD` 字符串前缀陷阱、结尾多余斜杠、非绝对路径 | ✓ 全部符合预期；并用真实配置复核 `baseline` 的 5 个写入目标都避开了禁区 |
 | **云清单生成器** | `summary` 正常路径 / 退化为 `instance_public_ips` / 空输出 | ✓ 三种输入都产出合法 YAML，且**不会生成 `local` 组** |
-| **22 个 YAML 文件全部可解析** | `selftest.py` 第 1 项 | ✓ |
+| **24 个 YAML 文件全部可解析** | `selftest.py` 第 1 项 | ✓ |
+| **镜像就位流程的形状** | `selftest.py` 第 5d 项（21 条断言）：拉取是不是独立任务、有没有 `timeout`、`up -d` 有没有「镜像已就位」门槛、失败信息里有没有三条路、80 自检是否接受「旧容器仍在服务」；另外把 `wf_stack_image_ready` 的表达式单独求值（6 种输入） | ✓ 结构成立、表达式真值正确（含 check 模式与变量未定义两种输入）；真机两条分支见第 14 / 15 行 |
 
 #### 第二段：真机验证（9 轮运行，5 个验收性质全部成立）
 
@@ -1645,7 +1707,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | 6 | **云侧真跑** | 临时清单入 `cloud` 组 + 传 `wf_docker_registry_mirrors` | ✓ Docker（docker.io 29.1.3 + compose v2 2.40.3）装上、`daemon.json`（含 mirrors 分支）写入、**nginx 容器在 8080 端口跑起来**，`curl` 拿到渲染的首页 |
 | 7 | **云侧幂等（修 bug 后）** | 连跑两次 `site.yml` | ✓ 第二次 `changed=0`，容器 healthy。第一次跑抓到了一个真 bug：首页嵌了渲染时间 → 每次都"变了" → 容器被无谓重启，见 [踩坑 28](PITFALLS.md) |
 | 8 | **双组冲突拦截** | 同一台机器同时放进 `cloud` 和 `local` | ✓ `guard` 的断言当场 fatal，报「一台机器不能两者都是」并指出该保留哪个组 |
-| 9 | **静态工具在 Linux 上复跑** | `check_guard.py` / `--selftest` / `selftest.py` | ✓ 8 类不变量、13 个用例、103 项断言在真实 Linux + Python 3.14 环境下同样全部通过 |
+| 9 | **静态工具在 Linux 上复跑** | `check_guard.py` / `--selftest` / `selftest.py` | ✓ 8 类不变量、13 个用例、136 项断言在真实 Linux + Python 3.14 环境下同样全部通过 |
 
 **2026-09-30 复跑了一遍**（换了台 WSL 实例，确认上一轮结论不是那台机器的偶然）：
 
@@ -1655,13 +1717,19 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | 11 | 第 1/2/5 轮 | ✓ `verify.yml` `ok=29 changed=0`；`site.yml` 默认路径 E 幕门闩生效、零变更；补缺后重跑仍 `changed=0` |
 | 12 | 「只补缺」决定性问题 | ✓ 用 `-e` 注入一个**缺失的目录**制造差异：`changed=1`（补缺动手了），同时时区 / sysctl / limits 的 md5 前后完全一致（覆盖类一个没动），跑完把探针目录删掉 |
 | 13 | 云侧重构建 + `now()` 回归 | ✓ 删掉 role 管理的 `index.html` → 重建（`changed=2`，重建后 md5 与删之前一致）→ 再跑 `changed=0`：模板确实是「事实的函数」而不是「时间的函数」 |
+| 14 | **真机拉镜像（走加速器）** | ✓ 2026-10-22，阿里云 ECS `121.196.x.x`（cn-hangzhou）：`-e wf_docker_registry_mirrors=[https://docker.m.daocloud.io]` → `daemon.json` 落盘 → `flush_handlers` 重启 docker → 断言 `docker info` 的 Registry Mirrors 段**真的出现了这条地址**（`[https://docker.m.daocloud.io/]`）→ 镜像就位 → `up -d` → 容器 healthy、80 反代 200；全程 `failed=0` |
+| 15 | **真机验两条失败分支** | ✓ 同一台机器，把镜像名换成不存在的 tag：<br>· 容器已停 → `80 返回 502`，内容是待部署页，断言通过，最后统一 `fail`，信息里含真实 stderr + 三个镜像站的探测结果（daocloud 401 / 1ms 401 / hub 000）<br>· 旧容器仍在跑 → `80 返回 200`，判成「旧容器在服务」而不是故障，同样干净收场（`failed=1`，不是 uri 模块的原始报错）<br>· 恢复镜像名后重跑 `changed=0`、外部 `curl` 回到 200 |
 
 **明确没有验证的部分**（写成"已验证"会是假的）：
 
 - 真实的两台 192.168.1.x 存量机器（K3s / Jenkins / Harbor / GitLab 在它们身上）——
   它们不在这台 WSL 的网络可达范围内
-- 阿里云真机（`gen_cloud_inventory.py` 生成的清单没喂过真实 `terraform output`）
+- ~~阿里云真机（清单没喂过真实 `terraform output`）~~ —— **已补上**：2026-10-22 用 `aliyun-ecs/tf-outputs.json` 生成了 `inventory/hosts.cloud.yml`（`ansible_host: 121.196.x.x`），`--limit cloud` 全流程跑通
 - `docker compose` 版本差异导致的行为差别（真机上是 2.40.3，只验了这一个版本）
+- 三条出路里**「离线镜像包」那条**：只在离线验了任务形状（上传 → `docker load` → 删临时包），
+  没在真实 ECS 上跑过完整一遍（加速器那条已在 2026-10-22 真机验过，见第 14 / 15 行）
+- `docker info` 里 Registry Mirrors 段**超过 3 条地址**时会少看几行（断言用 `grep -A3`）——
+  一条地址的真机输出已核对过（`[https://docker.m.daocloud.io/]`），多条没验
 
 ↑ 曾经还有一条「B9 与豁免清单只在 Windows 上跑过」，**这一条已经补上**：2026-09-30 在
 同一台 Linux（Ubuntu 26.04 / Python 3.14.4）上把边界检查器完整复跑了一遍 ——

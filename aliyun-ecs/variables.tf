@@ -80,17 +80,6 @@ variable "internet_max_bandwidth_out" {
   default     = 5
 }
 
-variable "app_stack_port" {
-  description = "Ansible 的 app_stack role 对外暴露的端口，安全组要放开它。刻意与 80 错开 —— user_data 已经在 80 上起了系统 nginx"
-  type        = number
-  default     = 8080
-
-  validation {
-    condition     = var.app_stack_port >= 1 && var.app_stack_port <= 65535
-    error_message = "app_stack_port 需是 1~65535 之间的端口号。"
-  }
-}
-
 variable "ssh_public_key" {
   description = "可选：SSH 公钥内容，传入则用密钥对登录而非密码"
   type        = string

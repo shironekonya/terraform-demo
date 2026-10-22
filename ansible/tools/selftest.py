@@ -468,7 +468,8 @@ def test_stack_templates() -> None:
         check("服务名用了 wf_stack_name", "wf-web" in services, list(services))
         svc = services.get("wf-web", {})
         check("镜像正确", svc.get("image") == "nginx:alpine", svc)
-        check("端口映射正确（8080:80）", svc.get("ports") == ["8080:80"], svc.get("ports"))
+        check("端口只绑回环，不对外（127.0.0.1:8080:80）",
+              svc.get("ports") == ["127.0.0.1:8080:80"], svc.get("ports"))
         check("首页文件以只读挂载", any("index.html" in str(v) and str(v).endswith(":ro")
                                         for v in svc.get("volumes") or []), svc.get("volumes"))
         check("带健康检查", "healthcheck" in svc, svc)
@@ -486,6 +487,201 @@ def test_stack_templates() -> None:
     ctx2 = dict(ctx, inventory_hostname="demo-ecs-2", ansible_host="47.98.56.78")
     html_out2 = env.get_template("roles/app_stack/templates/index.html.j2").render(**ctx2)
     check("两台机器渲染出的首页不同（体现各自身份）", html_out != html_out2)
+
+
+def test_image_preflight() -> None:
+    """镜像就位：拉不到的时候不能"装死"。
+
+    这里校验的是**任务的形状**，不是运行结果（结果只能连上机器才知道）。
+    但形状能挡住三类最要命的退化：
+
+      · 又把「拉镜像」塞回 `docker compose up -d` 里 —— 失败时只有 dockerd 原文；
+      · `up -d` 不检查镜像是否到位 —— 没镜像时必然失败，而且报错离原因很远；
+      · 拉不到就把整幕带走 —— 80 停在 user_data 的欢迎页上，机器看起来"死了"。
+
+    判据都落在可读的结构上（有没有 timeout、when 里有没有镜像门槛、
+    失败信息里有没有可执行的下一步），而不是"跑一遍看它成不成"。
+    """
+    print("\n[5d] 镜像就位（拉不到时给出路，而不是装死）")
+    tasks = yaml.safe_load(
+        (ROOT / "roles" / "app_stack" / "tasks" / "main.yml").read_text(encoding="utf-8")
+    )
+    defaults = yaml.safe_load(
+        (ROOT / "roles" / "app_stack" / "defaults" / "main.yml").read_text(encoding="utf-8")
+    )
+    docker_tasks = yaml.safe_load(
+        (ROOT / "roles" / "docker_engine" / "tasks" / "main.yml").read_text(encoding="utf-8")
+    )
+
+    flat: list[dict] = []
+
+    def walk(items) -> None:
+        for task in items or []:
+            if not isinstance(task, dict):
+                continue
+            flat.append(task)
+            for key in ("block", "rescue", "always"):
+                walk(task.get(key))
+
+    walk(tasks)
+
+    def find(needle: str) -> dict:
+        for task in flat:
+            if needle in str(task.get("name", "")):
+                return task
+        return {}
+
+    def when_text(task: dict) -> str:
+        value = task.get("when")
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        return " ".join(str(v) for v in value)
+
+    def args_of(task: dict) -> dict:
+        """任务的模块参数（Ansible 的写法是 `模块名: {参数}`）。"""
+        for key, value in task.items():
+            if isinstance(key, str) and key.startswith("ansible.builtin."):
+                return value if isinstance(value, dict) else {}
+        return {}
+
+    def argv_of(task: dict) -> list[str]:
+        args = args_of(task)
+        if "argv" in args:
+            return [str(v) for v in args["argv"]]
+        return [str(args.get("cmd", ""))]
+
+    check("defaults 里有离线包开关 wf_stack_image_tar（默认关）",
+          defaults.get("wf_stack_image_tar") == "", defaults.get("wf_stack_image_tar"))
+    check("拉取有硬超时（wf_stack_pull_timeout 是正整数）",
+          isinstance(defaults.get("wf_stack_pull_timeout"), int) and defaults["wf_stack_pull_timeout"] > 0,
+          defaults.get("wf_stack_pull_timeout"))
+    check("镜像站候选是非空列表（失败时用来测可达性）",
+          isinstance(defaults.get("wf_stack_mirror_candidates"), list) and bool(defaults["wf_stack_mirror_candidates"]),
+          defaults.get("wf_stack_mirror_candidates"))
+
+    probe = find("探测镜像是否已在本机")
+    check("先探测本机有没有这个镜像", bool(probe) and probe.get("changed_when") is False)
+
+    pull = find("从镜像仓库拉取")
+    pull_argv = argv_of(pull)
+    check("拉镜像是独立任务，不是让 compose 边拉边起",
+          bool(pull) and "pull" in pull_argv and "up" not in pull_argv, pull_argv)
+    check("拉取外面套了 timeout（给一个硬上限，而不是无限等）",
+          "timeout" in pull_argv, pull_argv)
+    check("拉取用变量而不是写死镜像名", pull_argv[-1:] == ["{{ wf_stack_image }}"], pull_argv)
+    check("拉取失败不在这里 raise（要留给 80 配完再统一收场）",
+          pull.get("failed_when") is False, pull.get("failed_when"))
+
+    up = find("拉起容器栈")
+    check("up -d 以「镜像已就位」为门槛", "wf_stack_image_ready" in when_text(up), when_text(up))
+    check("原本的幂等条件还在（文件变了 / 没在跑才动手）",
+          "wf_stack_file.changed" in when_text(up) and "wf_stack_ps" in when_text(up), when_text(up))
+
+    front_check = find("验证 80 确实反代到了容器")
+    check("80 的 200 自检只在镜像就位时跑", "wf_stack_image_ready" in when_text(front_check), when_text(front_check))
+
+    pending = find("容器没起来时，80 要么给待部署页")
+    pending_args = args_of(pending)
+    pending_status = str(pending_args.get("status_code")).replace("'", "")
+    check("镜像没拿到时仍然验 80（待部署页 + 5xx）",
+          "502" in pending_status and "504" in pending_status, pending_status)
+    # ★ 200 也必须放行：镜像没到位时旧容器可能还在跑，那是「降级但可用」，
+    #   不是错误。只允许 5xx 会让 uri 模块当场报错，把真正的失败原因盖掉。
+    check("旧容器仍在服务（80 返回 200）时不算错，别让 uri 模块先炸",
+          "200" in pending_status and pending.get("failed_when") is False,
+          f"{pending_status} / failed_when={pending.get('failed_when')}")
+
+    pending_assert = find("5xx 页面确实是待部署页")
+    pending_that = " ".join(str(v) for v in (args_of(pending_assert).get("that") or []))
+    check("断言仍然要求「内容真的是待部署页」（不能只验状态码）",
+          "应用还没起来" in pending_that, pending_that)
+
+    final_fail = find("判定本次部署失败")
+    fail_msg = str(args_of(final_fail).get("msg", ""))
+    check("失败在最后统一收场，而不是半路中断", bool(final_fail) and "wf_stack_image_ready" in when_text(final_fail),
+          when_text(final_fail))
+    check("失败信息给了「离线包」这条路", "离线" in fail_msg and "docker save" in fail_msg)
+    check("失败信息给了「镜像加速」这条路（含具体去哪里取地址）", "mirror.aliyuncs.com" in fail_msg)
+    check("失败信息里带上了 docker pull 的真实报错", "stderr_lines" in fail_msg)
+
+    # docker_engine 侧：写进文件 ≠ 生效
+    docker_flat: list[dict] = []
+
+    def walk_docker(items) -> None:
+        for task in items or []:
+            if not isinstance(task, dict):
+                continue
+            docker_flat.append(task)
+            for key in ("block", "rescue", "always"):
+                walk_docker(task.get(key))
+
+    walk_docker(docker_tasks)
+    mirror_check = next(
+        (t for t in docker_flat if "取出加速器" in str(t.get("name", ""))), {}
+    )
+    mirror_cmd = " ".join(argv_of(mirror_check))
+    check("docker_engine 会复核加速器是否真的生效", bool(mirror_check), mirror_check)
+    check("复核看的是 docker info 里的 Registry Mirrors（不是配置文件）",
+          "Registry Mirrors" in mirror_cmd, mirror_cmd)
+    assert_tasks = [t for t in docker_flat if "加速器已经真的生效" in str(t.get("name", ""))]
+    check("生效性用断言表达（不生效就红）",
+          bool(assert_tasks) and "wf_docker_mirror_lines" in str(assert_tasks[0]), assert_tasks[:1])
+
+
+def test_front_door_template() -> None:
+    """对外入口：nginx 反代 + 兜底页。
+
+    这两个模板是「只有一个公网入口」这条边界的落点，离线能验的部分不多，
+    但足以挡住最要命的三种写错：端口没跟着变量走、兜底页被外部直接访问、
+    以及把发行版的 sites-enabled / conf.d 又 include 回来（那会让默认站点抢 80）。
+    """
+    print("\n[5b] 对外入口（nginx 反代 + 待部署页）")
+    env = make_env()
+    ctx = {
+        "inventory_hostname": "demo-ecs-1",
+        "wf_stack_port": 8080,
+        "wf_stack_dir": "/opt/wf/stacks/wf-web",
+        "wf_front_dir": "/var/www/wf-front",
+        "wf_nginx_user": "www-data",
+    }
+
+    out = env.get_template("roles/app_stack/templates/nginx.conf.j2").render(**ctx)
+    flat = " ".join(out.split())
+    # 注释里会提到 sites-enabled（解释为什么不用它），所以判定要看"去掉注释的配置"
+    code_flat = " ".join(
+        line for line in out.splitlines() if not line.strip().startswith("#")
+    )
+
+    check("渲染出 server 块", "server {" in flat)
+    check("80 是默认站点（否则请求会落到发行版默认站点上）",
+          "listen 80 default_server;" in flat)
+    check("反代目标是回环 + wf_stack_port（不是硬编码 8080）",
+          "proxy_pass http://127.0.0.1:8080;" in flat)
+    check("端口换成别的值时模板跟着变",
+          "127.0.0.1:9090" in " ".join(
+              env.get_template("roles/app_stack/templates/nginx.conf.j2")
+              .render(**dict(ctx, wf_stack_port=9090)).split()),
+          "如果这里失败，说明端口被写死了")
+    check("上游不可用时有兜底页", "error_page 502 503 504 /_wf-pending.html;" in flat)
+    check("兜底页是 internal（外部不能绕过反代直接访问）",
+          "location = /_wf-pending.html" in flat and "internal;" in flat)
+    check("不再 include 发行版的 sites-enabled / conf.d",
+          "sites-enabled" not in code_flat and "conf.d" not in code_flat,
+          "include 回来就会出现两个 server 抢 80，且哪一个生效取决于文件名顺序")
+    check("进程用户来自变量（Debian 是 www-data，RHEL 系是 nginx）",
+          "user www-data;" in flat)
+
+    page = env.get_template("roles/app_stack/templates/wf-pending.html.j2").render(**ctx)
+    check("待部署页含主机名", "demo-ecs-1" in page)
+    check("待部署页是完整 HTML",
+          page.lstrip().startswith("<!DOCTYPE html>") and "</html>" in page)
+    check("待部署页不含渲染时间（否则每次运行都 changed）",
+          "{{" not in page and " now(" not in page)
+    check("两台机器渲染出的待部署页不同（体现各自身份）",
+          page != env.get_template("roles/app_stack/templates/wf-pending.html.j2")
+          .render(**dict(ctx, inventory_hostname="demo-ecs-2")))
 
 
 def test_baseline_templates() -> None:
@@ -790,6 +986,8 @@ def main() -> int:
     test_audit_report()
     test_daemon_json()
     test_stack_templates()
+    test_front_door_template()
+    test_image_preflight()
     test_baseline_templates()
     test_inventory_generator()
     test_guard_truth_table()

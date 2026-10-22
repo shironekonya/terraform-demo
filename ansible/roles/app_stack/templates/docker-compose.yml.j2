@@ -12,8 +12,11 @@ services:
     image: {{ wf_stack_image }}
     container_name: {{ wf_stack_name }}
     restart: unless-stopped
+    # ★ 只绑回环：公网入口是系统 nginx 的 80，它反代到这里。
+    #   写成 "8080:80" 会绑到 0.0.0.0 —— 容器就又成了一个对外的第二入口，
+    #   而安全组一旦放开这个端口，"只暴露 80"这句话立刻失效。
     ports:
-      - "{{ wf_stack_port }}:80"
+      - "127.0.0.1:{{ wf_stack_port }}:80"
     volumes:
       - {{ wf_stack_dir }}/index.html:/usr/share/nginx/html/index.html:ro
     environment:

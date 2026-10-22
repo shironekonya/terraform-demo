@@ -45,7 +45,7 @@
   ansible.builtin.package:
     name: "{{ wf_docker_package }}"
     state: present
-  when: wf_docker_probe.rc != 0
+  when: (wf_docker_probe.rc | default(0)) != 0
 
 - name: "docker_engine · 探测 compose 子命令（只读）"
   ansible.builtin.command: docker compose version
@@ -60,14 +60,14 @@
   # 各发行版的包名不统一，装不上不致命（还可能已经有 v1 的 docker-compose）。
   # 下面的复检会给出准确结论。
   failed_when: false
-  when: wf_compose_probe.rc != 0
+  when: (wf_compose_probe.rc | default(0)) != 0
 
 - name: "docker_engine · 复检 compose 子命令（只读）"
   ansible.builtin.command: docker compose version
   register: wf_compose_recheck
   changed_when: false
   failed_when: false
-  when: wf_compose_probe.rc != 0
+  when: (wf_compose_probe.rc | default(0)) != 0
 
 - name: "docker_engine · compose 不可用的应对说明"
   ansible.builtin.debug:
@@ -79,7 +79,7 @@
       - "  装好后重跑本 playbook 即可。"
       - "  依赖 compose 的 role（app_stack）会自动跳过，不会因此失败。"
   when:
-    - wf_compose_probe.rc != 0
+    - (wf_compose_probe.rc | default(0)) != 0
     - wf_compose_recheck.rc | default(1) != 0
 
 # ---------------------------------------------------------------------------
@@ -123,6 +123,54 @@
     enabled: true
     state: started
   failed_when: false
+
+# ---------------------------------------------------------------------------
+# 复核：daemon.json 里写了 ≠ docker 用上了
+#
+# 这是「配了加速器还是不生效」的根源：daemon.json 是**启动时**读的，
+# 文件改完不重启 docker，`docker pull` 仍旧走原来那条路。
+# 而它不会报任何错 —— 现象就是"我明明配了，怎么还是 i/o timeout"。
+#
+# 所以这里不看文件、直接问守护进程：`docker info` 里出现了这条地址，才算生效。
+# ---------------------------------------------------------------------------
+
+- name: "docker_engine · 立即应用 daemon.json（不等本幕结束）"
+  ansible.builtin.meta: flush_handlers
+  when: (wf_docker_registry_mirrors | length) > 0
+
+- name: "docker_engine · 取出加速器那一段（只读）"
+  ansible.builtin.shell:
+    cmd: docker info 2>/dev/null | grep -A3 "Registry Mirrors:"
+  register: wf_docker_mirror_lines
+  changed_when: false
+  failed_when: false
+  when:
+    - (wf_docker_registry_mirrors | length) > 0
+    # check 模式下 shell 不会执行，拿不到 stdout；这条复核只在真跑时有意义
+    - not ansible_check_mode
+
+- name: "docker_engine · 断言：加速器已经真的生效"
+  ansible.builtin.assert:
+    that:
+      - (wf_docker_registry_mirrors | first) in (wf_docker_mirror_lines.stdout | default(''))
+    fail_msg: |
+      ⛔ daemon.json 里写了 registry-mirrors，但 `docker info` 里看不到
+      {{ wf_docker_registry_mirrors | first }} —— 也就是说它没有生效。
+
+      常见的三个原因：
+        1. docker 没有重启（daemon.json 是启动时读的）
+           手工复核：systemctl restart docker && docker info | grep -A3 "Registry Mirrors"
+        2. daemon.json 不是合法 JSON（docker 会静默忽略整份文件）
+           手工复核：python3 -m json.tool /etc/docker/daemon.json
+        3. 地址写错（少了 https://，或者把"加速器编码"拼错了）
+           正确形状：https://xxxxxxxx.mirror.aliyuncs.com
+
+      `docker info` 里的 Registry Mirrors 段（本应出现在这里）：
+      {{ (wf_docker_mirror_lines.stdout | default('(空 —— 说明这一段根本没出现在 docker info 里)')) }}
+    quiet: true
+  when:
+    - (wf_docker_registry_mirrors | length) > 0
+    - not ansible_check_mode
 
 - name: "docker_engine · 把用户加入 docker 组"
   ansible.builtin.user:

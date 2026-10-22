@@ -6,10 +6,64 @@ wf_stack_root: /opt/wf/stacks
 wf_stack_name: wf-web
 wf_stack_dir: "{{ wf_stack_root }}/{{ wf_stack_name }}"
 
-# 对外端口。默认 8080 —— 刻意避开 80：
-# 阿里云 ECS 的 user_data 已经在 80 上起了系统 nginx（见 aliyun-ecs/ecs.tf），
-# 两个声明式工具抢同一个端口正是这个项目一路在避免的事。
-# 在 group_vars/cloud.yml 里也可以覆盖。
+# 容器栈在**宿主机回环**上监听的端口（不是公网端口）。
+#
+# 为什么是回环而不是 0.0.0.0：公网入口只有一个 —— 系统 nginx 的 80，
+# 它反代到 127.0.0.1:{{ wf_stack_port }}。容器本身不直接对外，
+# 于是「谁能从外面进来」这件事只需要在一个地方（安全组 + nginx）说清楚。
+#
+# 为什么还要一个非 80 的端口：80 已经被系统 nginx 占着，它是公网唯一入口。
+# 两个进程不能同时 listen 80，所以容器退到 8080，由 nginx 转一手。
 wf_stack_port: 8080
 
 wf_stack_image: nginx:alpine
+
+# ---------------------------------------------------------------------------
+# 镜像从哪来 —— 顺序是「离线包 → 本机已有 → 远程拉」
+#
+# ★ 为什么把「拿到镜像」从 `docker compose up -d` 里拆出来单独做：
+#
+#   up -d 内部会自己拉镜像，失败时的报错是 dockerd 的原文，长这样：
+#
+#     Error response from daemon: failed to resolve reference
+#     "docker.io/library/nginx:alpine": ... dial tcp 122.248.226.57:443: i/o timeout
+#
+#   它说了"失败"，没说"下一步做什么"；而且卡满 30 秒才吐出来。
+#   更糟的是它发生在 `up -d` 里 —— 这个任务一失败，后面的「对外入口」整段
+#   就都不跑了，于是 80 上连待部署页都没有，机器看起来像死了。
+#
+#   所以顺序改成：先单独把镜像弄到位（探 → 导入 / 拉取），拿到之后再 up -d。
+#   拉不到就明说三条路，同时**照旧把 80 配好**（给待部署页），最后再判失败。
+#   「机器活着、应用没起来」和「机器都配不上」是两件事，不该混成同一个报错。
+# ---------------------------------------------------------------------------
+
+# 控制端上的离线镜像包（`docker save` 的产物，gz 也行）。留空 = 不用离线包。
+# 用法：ansible-playbook ... -e wf_stack_image_tar=/abs/path/nginx-alpine.tar.gz
+wf_stack_image_tar: ""
+
+# 单次 docker pull 的硬超时（秒）。外面套 `timeout` 命令，而不是靠 retries：
+# 拉不动通常是网络整段不通（30 秒 dial timeout），重试只是把等待乘以次数。
+wf_stack_pull_timeout: 60
+
+# 拉取失败时用来探测「这台机器够得着哪些镜像站」的候选地址（只探测，不切换）。
+# 结果会原样打进失败信息里，让人直接挑一个填进 group_vars/cloud.yml。
+# ★ 可达 ≠ 可信：第三方镜像站是别人的机器，生产请用云厂商官方加速器。
+wf_stack_mirror_candidates:
+  - docker.m.daocloud.io
+  - docker.1ms.run
+  - registry-1.docker.io
+
+# ---------------------------------------------------------------------------
+# 对外入口：系统 nginx 把 80 反代到上面的 wf_stack_port
+#
+# 为什么不在 user_data 里写这段配置：Terraform 管"资源是否存在"，
+# Ansible 管"机器内部服务怎么配"。user_data 只负责把机器带到"能被 SSH 接管"的状态
+# （见 aliyun-ecs/ecs.tf），反代属于服务内部状态，归这里。
+# ---------------------------------------------------------------------------
+# 容器还没起来时（或起来后挂了）给访问者看的页面。
+# 它让"80 有响应"这件事在 Ansible 跑之前和之后都成立 —— 只是内容不同。
+wf_front_dir: /var/www/wf-front
+
+# 发行版之间只有这个值不同：Debian/Ubuntu 是 www-data，RHEL 系是 nginx。
+# 用 facts 推，而不是要求使用者手填 —— 填错了 nginx 会起不来，报错还很难懂。
+wf_nginx_user: "{{ 'www-data' if (ansible_os_family | default('Debian')) == 'Debian' else 'nginx' }}"

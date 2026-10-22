@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ inventory_hostname }} · 容器栈未就绪</title>
+  <style>
+    :root { color-scheme: light; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: #f6f7f9; color: #1f2328;
+    }
+    .card {
+      background: #fff; border: 1px solid #e5e7eb; border-left: 4px solid #d97706;
+      border-radius: 12px; padding: 30px 38px; min-width: 420px;
+    }
+    .tag { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #b45309; }
+    h1 { margin: 6px 0 14px; font-size: 22px; font-weight: 600; }
+    p { margin: 0 0 10px; font-size: 14px; line-height: 1.65; color: #374151; }
+    code { background: #f3f4f6; border-radius: 4px; padding: 1px 6px; font-size: 13px; }
+    .host { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: #111827; }
+    .foot { margin-top: 18px; padding-top: 12px; border-top: 1px solid #f0f0f0; font-size: 12px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="tag">nginx · 80 正常，上游未就绪</div>
+    <h1>机器在，应用还没起来</h1>
+    <p>
+      这台机器 <span class="host">{{ inventory_hostname }}</span> 已经由 Terraform 建好，
+      80 端口上的系统 nginx 也正常工作 —— 你现在看到的这一页就是它给的。
+    </p>
+    <p>
+      但它反代的容器栈（<code>127.0.0.1:{{ wf_stack_port }}</code>）暂时没有正常应答，
+      所以 80 转到了这张待部署页。
+    </p>
+    <p>
+      如果是刚建好还没跑 Ansible：正常，去执行
+      <code>ansible-playbook playbooks/site.yml --limit cloud</code>。
+      如果已经跑过：<code>ssh</code> 上去看 <code>docker ps -a</code> 和
+      <code>docker compose -f {{ wf_stack_dir }}/docker-compose.yml logs --tail 50</code>。
+    </p>
+    <div class="foot">
+      ★ 这一页由 roles/app_stack 生成，刻意不含渲染时间 —— 含时间会让每次运行都判成"文件变了"，
+      从而破坏幂等性（同一个坑在 index.html 上踩过一次）。
+      这份文件的内容只跟主机身份有关，因此重复运行是 <code>changed=0</code>。
+    </div>
+  </div>
+</body>
+</html>

@@ -34,10 +34,10 @@
     msg:
       - "⚠ 这台机器上 `docker compose` 不可用，跳过容器栈部署。"
       - "  先把它装上（见 docker_engine role 的提示），再重跑本 playbook。"
-  when: wf_app_compose_probe.rc != 0
+  when: (wf_app_compose_probe.rc | default(0)) != 0
 
 - name: "app_stack · 部署容器栈"
-  when: wf_app_compose_probe.rc == 0
+  when: (wf_app_compose_probe.rc | default(0)) == 0
   block:
 
     - name: "app_stack · 创建栈目录"
@@ -77,6 +77,107 @@
         mode: "0644"
       register: wf_stack_file
 
+    # -----------------------------------------------------------------------
+    # ★ 镜像就位：先单独把 image 弄到本机，再谈 up -d
+    #
+    #   顺序刻意是「探测 → 离线导入 / 远程拉取 → 判定」，而不是让 compose 自己拉：
+    #   compose 拉失败时报的是 dockerd 原文（i/o timeout），既不说怎么办，
+    #   又会把整个 block 里的后续任务全部带走 —— 连 80 的配置都轮不到跑。
+    # -----------------------------------------------------------------------
+    - name: "app_stack · 探测镜像是否已在本机（只读）"
+      ansible.builtin.command:
+        argv:
+          - docker
+          - image
+          - inspect
+          - "{{ wf_stack_image }}"
+      register: wf_stack_image_probe
+      changed_when: false
+      failed_when: false
+
+    - name: "app_stack · 本机没有镜像，用离线包导入"
+      when:
+        - (wf_stack_image_probe.rc | default(1)) != 0
+        - (wf_stack_image_tar | length) > 0
+      block:
+
+        # 离线包是「网络整段不通」时唯一可靠的路：镜像在有网的机器上 save 好，
+        # 这里只负责搬过来 load 进去，全程不访问任何 registry。
+        - name: "app_stack · 上传离线镜像包"
+          ansible.builtin.copy:
+            src: "{{ wf_stack_image_tar }}"
+            dest: /tmp/wf-stack-image.tar
+            mode: "0644"
+
+        - name: "app_stack · 导入离线镜像包"
+          ansible.builtin.command:
+            argv:
+              - docker
+              - load
+              - -i
+              - /tmp/wf-stack-image.tar
+          register: wf_stack_image_load
+          changed_when: true
+          # 不在这里失败：包里是什么、能不能 load，下面统一判定。
+          # 这里失败会把 80 的配置一起带走，那是更糟的结果。
+          failed_when: false
+
+        # 包可能有几个 GB，留在 /tmp 没意义，而且会被日志/备份扫到。
+        - name: "app_stack · 删掉临时镜像包"
+          ansible.builtin.file:
+            path: /tmp/wf-stack-image.tar
+            state: absent
+
+    # 没有离线包时才联网拉。外面套 `timeout` 是为了给一个硬上限：
+    # dockerd 自己的 dial 超时是 30 秒，但它会重试多个 endpoint，
+    # 不设上限时这个任务可能挂好几分钟，让人以为"卡住了"。
+    - name: "app_stack · 从镜像仓库拉取（本机没有、也没给离线包时）"
+      ansible.builtin.command:
+        argv:
+          - timeout
+          - "{{ wf_stack_pull_timeout }}"
+          - docker
+          - pull
+          - "{{ wf_stack_image }}"
+      register: wf_stack_pull
+      changed_when: (wf_stack_pull.rc | default(1)) == 0
+      failed_when: false
+      when:
+        - (wf_stack_image_probe.rc | default(1)) != 0
+        - (wf_stack_image_tar | length) == 0
+
+    # 三件事合起来回答一个问题：现在能不能 up -d。
+    # check 模式下一律当"能"，否则一次干跑会因为"没拉过镜像"而报错 ——
+    # 干跑的意义是看会改什么，不是验证网络。
+    - name: "app_stack · 判定镜像是否就位"
+      ansible.builtin.set_fact:
+        wf_stack_image_ready: >-
+          {{ ((wf_stack_image_probe.rc | default(1)) == 0)
+             or ((wf_stack_image_load.rc | default(1)) == 0)
+             or ((wf_stack_pull.rc | default(1)) == 0)
+             or ansible_check_mode }}
+
+    # 拉不到的时候顺手把「这台机器够得着谁」测出来。
+    # 这一步不是自动切换镜像站（那是替使用者做信任决定），
+    # 只是把事实摆到失败信息里，省掉"到底哪个地址能用"的反复试。
+    - name: "app_stack · 镜像没到位，探测各镜像站的可达性（只读）"
+      ansible.builtin.command:
+        argv:
+          - curl
+          - -sS
+          - -m
+          - "5"
+          - -o
+          - /dev/null
+          - -w
+          - "%{http_code}"
+          - "https://{{ item }}/v2/"
+      loop: "{{ wf_stack_mirror_candidates }}"
+      register: wf_stack_mirror_probe
+      changed_when: false
+      failed_when: false
+      when: not (wf_stack_image_ready | bool)
+
     - name: "app_stack · 探测栈是否在运行（只读）"
       ansible.builtin.command:
         argv:
@@ -92,7 +193,10 @@
       failed_when: false
 
     # ★ 只在真的有理由时才动手：
-    #   文件变了（含首页） 或 栈里一个容器都没在跑
+    #   镜像到位 且（文件变了 / 首页变了 / 一个容器都没在跑）
+    #
+    #   镜像没到位这一条是硬门槛：没有 image 时 up -d 必然失败，
+    #   而它失败的样子（dockerd 原文 + 30 秒超时）会盖掉真正的原因。
     - name: "app_stack · 拉起容器栈"
       ansible.builtin.command:
         argv:
@@ -107,7 +211,9 @@
       # 走到这里就说明上面已经判定"需要动手"，所以直接算 changed。
       # （不用解析 up -d 的输出猜有没有变化 —— 那种写法很脆。）
       changed_when: true
-      when: (wf_stack_file.changed | bool) or (wf_stack_index.changed | bool) or ((wf_stack_ps.stdout | default('') | trim) == '')
+      when:
+        - wf_stack_image_ready | bool
+        - (wf_stack_file.changed | bool) or (wf_stack_index.changed | bool) or ((wf_stack_ps.stdout | default('') | trim) == '')
 
     - name: "app_stack · 复核容器状态（只读）"
       ansible.builtin.command:
@@ -122,27 +228,219 @@
       changed_when: false
       failed_when: false
 
-    - name: "app_stack · 探测 80 端口是否被系统 nginx 占着（只读）"
-      ansible.builtin.shell: |
-        if command -v ss >/dev/null 2>&1; then
-          ss -lnt 2>/dev/null | awk 'NR>1 {print $4}' | sed 's/.*://' | grep -qx 80 && echo OCCUPIED || echo FREE
-        else
-          echo UNKNOWN
-        fi
-      args:
-        executable: /bin/sh
-      register: wf_port80
+# ---------------------------------------------------------------------------
+# 对外入口：80 → 本栈
+#
+# 这一段刻意**不在**上面那个 block 里。容器没起来时，80 仍然要有响应
+# （给一张"机器在、应用没就绪"的页面），所以它不能跟着容器部署一起被跳过。
+# ---------------------------------------------------------------------------
+- name: "app_stack · 探测系统 nginx 是否可用（只读）"
+  ansible.builtin.command:
+    cmd: nginx -v
+  register: wf_nginx_probe
+  changed_when: false
+  failed_when: false
+
+- name: "app_stack · 没有 nginx，跳过对外入口"
+  ansible.builtin.debug:
+    msg:
+      - "⚠ 这台机器上没有 nginx，跳过 80 → {{ wf_stack_port }} 的反代配置。"
+      - "  容器栈仍然只监听 127.0.0.1:{{ wf_stack_port }}，从外面访问不到。"
+      - "  user_data 本该把它装上（见 aliyun-ecs/ecs.tf），装好后重跑本 playbook。"
+  when: (wf_nginx_probe.rc | default(0)) != 0
+
+- name: "app_stack · 对外入口（仅当 nginx 可用）"
+  when: (wf_nginx_probe.rc | default(0)) == 0
+  block:
+
+    - name: "app_stack · 断言：容器端口不能是 80"
+      ansible.builtin.assert:
+        that:
+          - wf_stack_port | int != 80
+        fail_msg: |
+          ⛔ wf_stack_port 不能是 80。
+          80 归系统 nginx（公网唯一入口），容器栈必须待在别的端口上，由 nginx 反代。
+          两边都写 80 的结果不是"更直接"，而是 nginx 起不来。
+        quiet: true
+
+    - name: "app_stack · 创建待部署页目录"
+      ansible.builtin.file:
+        path: "{{ wf_front_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: "app_stack · 渲染待部署页（上游不可用时展示）"
+      ansible.builtin.template:
+        src: wf-pending.html.j2
+        dest: "{{ wf_front_dir }}/_wf-pending.html"
+        owner: root
+        group: root
+        mode: "0644"
+
+    # ★ validate：nginx -t 先在临时文件上跑一遍。配置写错时**旧文件原样保留**，
+    #   而不是先覆盖再 reload 失败 —— 后者会让 80 直接不可用，连错误页都打不开。
+    - name: "app_stack · 渲染 nginx 主配置（nginx -t 不通过就不落盘）"
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        owner: root
+        group: root
+        mode: "0644"
+        backup: true
+        validate: "nginx -t -c %s"
+      register: wf_nginx_conf
+      notify: "重载 nginx"
+
+    - name: "app_stack · 确保 nginx 在运行"
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: "app_stack · 立即应用配置（不等整幕结束）"
+      ansible.builtin.meta: flush_handlers
+
+    # 自检：从机器本机访问 80，必须拿到容器那页（200）。
+    # 拿不到 200 说明反代没通 —— 这时候宁可报错，也不要"看起来部署成功"。
+    - name: "app_stack · 验证 80 确实反代到了容器"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/"
+        status_code: 200
+        timeout: 5
+      register: wf_front_check
+      changed_when: false
+      retries: 5
+      delay: 2
+      until: wf_front_check.status | default(0) == 200
+      when:
+        - not ansible_check_mode
+        - wf_stack_image_ready | default(false) | bool
+
+    # 容器没起来（镜像没拿到）时，80 仍然是"机器活着"的唯一信号，
+    # 所以这一段单独验：给的是待部署页，状态码保持 5xx。
+    #
+    # 两条断言缺一不可：
+    #   · 只验状态码 → nginx 自带的 502 默认页也能过
+    #   · 只验内容   → 有人把 error_page 改成返回 200，监控就再也看不见故障
+    #
+    # ★ 为什么 status_code 里也放 200，而不是只放 5xx：
+    #   镜像没到位时，**旧容器可能还在跑**（新的起不来，旧的不会自己停）。
+    #   这时 80 正常返回 200，是「降级但可用」，不是错误。
+    #   只允许 5xx 的话，uri 模块会当场报 "Status code was 200 and not [502,503,504]"
+    #   —— 一个纯粹的预期内分支，把后面那条真正的失败原因（镜像没拿到）盖掉了。
+    - name: "app_stack · 容器没起来时，80 要么给待部署页，要么旧容器还在服务"
+      ansible.builtin.uri:
+        url: "http://127.0.0.1/"
+        status_code: [200, 502, 503, 504]
+        return_content: true
+        timeout: 5
+      register: wf_front_pending
       changed_when: false
       failed_when: false
+      when:
+        - not ansible_check_mode
+        - not (wf_stack_image_ready | default(false) | bool)
 
-    - name: "app_stack · 部署结果"
-      ansible.builtin.debug:
-        msg:
-          - "栈目录        : {{ wf_stack_dir }}"
-          - "访问地址      : http://{{ ansible_host | default(inventory_hostname) }}:{{ wf_stack_port }}/"
-          - "本次是否动了  : {{ '是' if (wf_stack_up is changed) else '否（已是最新，changed=0）' }}"
-          - ""
-          - "容器状态："
-          - "{{ wf_stack_verify.stdout | default('(读不到)') }}"
-          - ""
-          - "关于 80 端口  : {{ '已被系统 nginx 占用（阿里云 user_data 装的），本栈用 ' ~ (wf_stack_port | string) ~ ' 不冲突' if wf_port80.stdout == 'OCCUPIED' else '当前没有服务占用 80' }}"
+    - name: "app_stack · 断言：5xx 页面确实是待部署页，不是 nginx 默认错误页"
+      ansible.builtin.assert:
+        that:
+          # 200 = 旧容器还在服务（也说得过去，不拦）
+          - (wf_front_pending.status | default(0)) == 200
+            or '应用还没起来' in (wf_front_pending.content | default(''))
+        fail_msg: |
+          ⛔ 80 的响应既不是 200，也不是待部署页 —— error_page 没生效。
+          拿到的状态码：{{ wf_front_pending.status | default('(没拿到)') }}
+          检查 /etc/nginx/nginx.conf 里的 error_page 502 503 504 /_wf-pending.html，
+          以及 {{ wf_front_dir }}/_wf-pending.html 是否存在。
+          页面开头：{{ (wf_front_pending.content | default(''))[:200] }}
+        quiet: true
+      when:
+        - not ansible_check_mode
+        - not (wf_stack_image_ready | default(false) | bool)
+
+- name: "app_stack · 部署结果"
+  ansible.builtin.debug:
+    msg:
+      - "栈目录        : {{ wf_stack_dir }}"
+      - "镜像          : {{ wf_stack_image }} —— {{ '本次未执行容器部署' if wf_stack_image_ready is not defined else ('已就位' if (wf_stack_image_ready | bool) else '⛔ 没拿到（见下面的失败原因）') }}"
+      - "公网入口      : http://{{ ansible_host | default(inventory_hostname) }}/   （80 → 127.0.0.1:{{ wf_stack_port }}）"
+      - "本次是否动了  : {{ '是' if (wf_stack_up is defined and wf_stack_up is changed) else '否（已是最新，changed=0）' }}"
+      - ""
+      - "容器状态："
+      - "{{ (wf_stack_verify.stdout | default('(读不到)')) if wf_stack_verify is defined else '(本次未执行容器部署)' }}"
+      - ""
+      - "入口配置      : {{ '已更新（nginx 已 reload）' if (wf_nginx_conf is defined and wf_nginx_conf is changed) else ('无变化' if wf_nginx_conf is defined else '本次未执行') }}"
+      - "入口自检      : {{ wf_front_door_line }}"
+  # 四层嵌套的三元表达式没人愿意读第二遍，所以用一块 vars 把判断摊开写。
+  vars:
+    wf_front_door_line: >-
+      {%- if wf_front_check is defined and (wf_front_check.status | default(0)) == 200 -%}
+      80 返回 200，反代通了
+      {%- elif wf_front_pending is defined and (wf_front_pending.status | default(0)) != 200 -%}
+      80 返回 {{ wf_front_pending.status }}，给的是待部署页（容器没起来）
+      {%- elif wf_front_pending is defined -%}
+      80 返回 200，是旧容器在服务（本次镜像没拿到，容器没更新）
+      {%- elif wf_front_check is defined -%}
+      80 没有返回 200 —— 查 nginx 与容器日志
+      {%- else -%}
+      本次未自检（check 模式或没有 nginx）
+      {%- endif -%}
+
+# ---------------------------------------------------------------------------
+# 镜像是唯一"必须联网才能拿到"的东西，所以它失败时单独收场：
+#
+#   机器已经被配好了（80 有响应、待部署页就位），但应用没起来 ——
+#   这不是成功，所以整幕以失败结束（CI 会红），失败信息里给出三条能走的路。
+#
+# 为什么不在拉取那一步直接 fail：
+#   那样后面的「对外入口」就跑不到，80 会停在 user_data 的欢迎页上，
+#   于是"镜像拉不到"和"机器都配不上"混成同一个现象。
+# ---------------------------------------------------------------------------
+- name: "app_stack · 镜像没到位 → 判定本次部署失败"
+  ansible.builtin.fail:
+    msg: |
+      ⛔ 容器镜像没拿到：{{ wf_stack_image }}
+
+      这台机器已经被配好了（80 有响应 —— 要么给的是待部署页，
+      要么旧容器还在跑），但应用没起来 —— 所以本次部署算失败，不当作"看起来成功"。
+
+      {% if wf_stack_pull is defined and wf_stack_pull.rc | default(1) != 0 %}
+      docker pull 的报错（末尾几行）：
+      {% for line in (wf_stack_pull.stderr_lines | default([]))[-4:] %}        {{ line }}
+      {% endfor %}
+      {% endif %}
+      {% if wf_stack_mirror_probe is defined and wf_stack_mirror_probe.results %}
+      从这台机器探测各镜像站（HTTP 码，000 = 连不上）：
+      {% for r in wf_stack_mirror_probe.results %}        {{ r.item }} → {{ (r.stdout | default('') | trim) or '000（超时/无 curl）' }}
+      {% endfor %}
+      {% endif %}
+      三条路，任选一条：
+
+      1) 配镜像加速（推荐；阿里云账号自带，免费且稳定）
+         地址在「容器镜像服务 ACR → 镜像工具 → 镜像加速器」，形如
+           https://xxxxxxxx.mirror.aliyuncs.com
+         填进 ansible/inventory/group_vars/cloud.yml：
+           wf_docker_registry_mirrors:
+             - https://xxxxxxxx.mirror.aliyuncs.com
+         然后重跑：docker_engine 会写 daemon.json 并重启 docker，
+         还会自己复核加速器有没有真的生效（写进文件 ≠ 生效）。
+
+      2) 用离线镜像包（网络整段不通时，唯一可靠的办法）
+         在有网的机器上：
+           docker pull {{ wf_stack_image }}
+           docker save {{ wf_stack_image }} | gzip > wf-image.tar.gz
+         把包拷到控制端，然后：
+           ansible-playbook playbooks/site.yml --limit cloud \
+             -e wf_stack_image_tar=/绝对路径/wf-image.tar.gz
+         role 会上传 → docker load → 删掉临时包，全程不访问仓库。
+
+      3) 换一个这台机器够得着的镜像
+           -e wf_stack_image=<registry>/<repo>:<tag>
+
+      ★ 第三方镜像站是别人的机器，可达不等于可信 ——
+        生产环境优先用云厂商官方加速器，或走离线包。
+  when:
+    - wf_stack_image_ready is defined
+    - not (wf_stack_image_ready | bool)

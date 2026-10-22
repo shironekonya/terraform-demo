@@ -121,7 +121,7 @@ python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65
 - 检查器**只用 Python 标准库**，不连云、不连机器、不装依赖，在任何机器上都能复现同一结果。
 - 跨层衔接、以及「不参与运行因而也不参与检查」的路径，都登记在 [`boundaries.yml`](boundaries.yml)，可逐条对照。
 - 文档分成三份，是为了让三类问题各有入口：结论与理由（本文）、实现与操作（[`LOGIC.md`](LOGIC.md)）、
-  失败模式（[`PITFALLS.md`](PITFALLS.md)，45 条，含**没有验证过的部分**）。
+  失败模式（[`PITFALLS.md`](PITFALLS.md)，49 条，含**没有验证过的部分**）。
 
 ---
 
@@ -135,6 +135,9 @@ python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65
   没有对应失败场景的规则，本仓库不会收录。
 - **不是一键部署。** 本地节点不会被创建，默认也不会被修改 —— 本项目关注的是
   「已存在的资源如何被安全地声明式管理」。
+- **不假设 Docker Hub 能连通。** 国内多数区域直连 `registry-1.docker.io` 会超时，
+  拉不到镜像时 playbook 会明确停在「镜像就位」这一步并给出三条路（加速器 / 离线包 / 换镜像），
+  而不是让 `docker compose up -d` 用一句 `i/o timeout` 收场（见 [`PITFALLS.md`](PITFALLS.md) 第 47 条）。
 - **不是验证报告。** 哪些经过真机验证、哪些只在本地运行过，在
   [`LOGIC.md` 的「验证状态」一节](LOGIC.md#验证状态) 中逐条列出，包括**未验证的部分**。
 
@@ -146,7 +149,7 @@ python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65
 |---|---|
 | **为什么做这个项目、为什么这么设计** | 就是本文 |
 | **代码怎么组织、命令怎么跑、怎么验收** | [`LOGIC.md`](LOGIC.md) |
-| **实践中遇到的问题（45 条，按轮次分组，带索引）** | [`PITFALLS.md`](PITFALLS.md) |
+| **实践中遇到的问题（49 条，按轮次分组，带索引）** | [`PITFALLS.md`](PITFALLS.md) |
 | 层与层之间的数据传递、哪些路径不参与检查 | [`boundaries.yml`](boundaries.yml) |
 | 九条边界如何被自动检查 | [`tools/check_boundaries.py`](tools/check_boundaries.py) |
 | 环境变更如何被收敛到一条路径 | [`.gitlab-ci.yml`](.gitlab-ci.yml) |
