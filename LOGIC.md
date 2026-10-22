@@ -660,6 +660,20 @@ terraform providers lock -platform=windows_amd64 -platform=linux_amd64
 收尾是 `terraform destroy`，之后**再看一眼 `terraform plan`**：它应为空。
 「销毁成功」的输出不等于「没有残留」。
 
+#### 回收时要顺带清掉的三样东西
+
+`destroy` 之后云机器就没了，但本地还留着三处指向它的东西：
+
+| 遗留物 | 不清的后果 | 怎么清 |
+|---|---|---|
+| `ansible/inventory/hosts.cloud.yml` | 清单里是指向已释放 IP 的主机，下次 `ansible-playbook` 卡在连接超时 | 删文件，下次 `apply` 后重新生成 |
+| `~/.ssh/known_hosts` 里该 IP 的记录 | 公网 IP 会被回收再分配，重建的机器大概率拿到同一个 IP，于是 ssh 报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，Ansible 在第一幕 `Gathering Facts` 就判 `UNREACHABLE` | `ssh-keygen -f ~/.ssh/known_hosts -R <该 IP>` |
+| `aliyun-ecs/tf-outputs.json`（若生成过） | 一份过期载荷，`--from-output-json` 会读到旧 IP | 删文件 |
+
+第二样最容易被忽略，因为 `destroy` 的视角里它根本不存在。但它是**唯一一个会跨 destroy 存活、并且在下一次 `apply` 之后才发作**的遗留物。
+
+`ansible.cfg` 里的 `StrictHostKeyChecking=accept-new` 是这件事会上报的原因：没见过的机器自动接受，**见过的机器换了键就拒绝**。这不是障碍 —— 云上「同一个 IP 背后换了台机器」是常态，静默接受才是问题。
+
 ### 第 3、4 步 · 本地部分
 
 见 [阶段二](#阶段二--本地部分三档递进)。第 1 档（默认）只盘点，判据是四份报告全部打印出来，
