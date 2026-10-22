@@ -121,7 +121,7 @@ python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65
 - 检查器**只用 Python 标准库**，不连云、不连机器、不装依赖，在任何机器上都能复现同一结果。
 - 跨层衔接、以及「不参与运行因而也不参与检查」的路径，都登记在 [`boundaries.yml`](boundaries.yml)，可逐条对照。
 - 文档分成三份，是为了让三类问题各有入口：结论与理由（本文）、实现与操作（[`LOGIC.md`](LOGIC.md)）、
-  失败模式（[`PITFALLS.md`](PITFALLS.md)，41 条，含**没有验证过的部分**）。
+  失败模式（[`PITFALLS.md`](PITFALLS.md)，45 条，含**没有验证过的部分**）。
 
 ---
 
@@ -146,7 +146,7 @@ python3 tools/check_boundaries.py --selftest  # 证明检查器确实会响：65
 |---|---|
 | **为什么做这个项目、为什么这么设计** | 就是本文 |
 | **代码怎么组织、命令怎么跑、怎么验收** | [`LOGIC.md`](LOGIC.md) |
-| **实践中遇到的问题（41 条，按轮次分组，带索引）** | [`PITFALLS.md`](PITFALLS.md) |
+| **实践中遇到的问题（45 条，按轮次分组，带索引）** | [`PITFALLS.md`](PITFALLS.md) |
 | 层与层之间的数据传递、哪些路径不参与检查 | [`boundaries.yml`](boundaries.yml) |
 | 九条边界如何被自动检查 | [`tools/check_boundaries.py`](tools/check_boundaries.py) |
 | 环境变更如何被收敛到一条路径 | [`.gitlab-ci.yml`](.gitlab-ci.yml) |

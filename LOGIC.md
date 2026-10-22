@@ -32,7 +32,7 @@
 - [阶段五 · Ansible：批量管理云服务器与本地服务器](#阶段五--ansible批量管理云服务器与本地服务器) — 云机器随便改，本地机器默认一个字节都不改
 - [环境要求](#环境要求)
 - [验证状态](#验证状态)
-- [踩坑清单（41 条）](#踩坑清单41-条) — ★ 已单独成册：[`PITFALLS.md`](PITFALLS.md)
+- [踩坑清单（45 条）](#踩坑清单45-条) — ★ 已单独成册：[`PITFALLS.md`](PITFALLS.md)
 - [成本与风险提示](#成本与风险提示)
 
 > **三条容易混淆的线索，先说清楚：**
@@ -667,7 +667,7 @@ terraform providers lock -platform=windows_amd64 -platform=linux_amd64
 | 遗留物 | 不清的后果 | 怎么清 |
 |---|---|---|
 | `ansible/inventory/hosts.cloud.yml` | 清单里是指向已释放 IP 的主机，下次 `ansible-playbook` 卡在连接超时 | 删文件，下次 `apply` 后重新生成 |
-| `~/.ssh/known_hosts` 里该 IP 的记录 | 公网 IP 会被回收再分配，重建的机器大概率拿到同一个 IP，于是 ssh 报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，Ansible 在第一幕 `Gathering Facts` 就判 `UNREACHABLE` | `ssh-keygen -f ~/.ssh/known_hosts -R <该 IP>` |
+| `~/.ssh/known_hosts` 里该 IP 的记录 | 公网 IP 会被回收再分配，重建的机器大概率拿到同一个 IP，于是 ssh 报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，Ansible 在第一幕 `Gathering Facts` 就判 `UNREACHABLE`（踩坑 45） | `ssh-keygen -f ~/.ssh/known_hosts -R <该 IP>` |
 | `aliyun-ecs/tf-outputs.json`（若生成过） | 一份过期载荷，`--from-output-json` 会读到旧 IP | 删文件 |
 
 第二样最容易被忽略，因为 `destroy` 的视角里它根本不存在。但它是**唯一一个会跨 destroy 存活、并且在下一次 `apply` 之后才发作**的遗留物。
@@ -1768,9 +1768,9 @@ load_config()  # 内部先看 WF_CONFIG_JSON，没有再解 base64
 
 校验过程中实际修掉的问题，都是容易踩的坑 —— 从第五轮起它们被逐条记下来，现在已单独成册。
 
-## 踩坑清单（41 条）
+## 踩坑清单（45 条）
 
-全部 41 条在 **[`PITFALLS.md`](PITFALLS.md)**：按十轮分组，带可检索的索引表，
+全部 45 条在 **[`PITFALLS.md`](PITFALLS.md)**：按十一轮分组，带可检索的索引表，
 每条都写清了「症状是什么 / 为什么编译期和静态检查抓不到 / 背后的规律」。
 
 正文里出现的「见踩坑 27」这类引用，编号就是那份清单里的编号。
@@ -1787,6 +1787,7 @@ load_config()  # 内部先看 WF_CONFIG_JSON，没有再解 base64
 | 第八轮 | 守住分层边界 | 29–31 | 3 |
 | 第九轮 | CI/CD 成为唯一触发器 + 跨层衔接声明化 | 32–36 | 5 |
 | 第十轮 | 宿主机边界 + 豁免登记 | 37–41 | 5 |
+| 第十一轮 | 真机联调（Terraform 交出去之后） | 42–45 | 4 |
 
 ★ 标记的是「不报错但后果严重」和「看似在保护你、其实没保护」的那几类，建议优先读。
 
