@@ -4,16 +4,18 @@
 # ★ 由 CI/147 的 bootstrap 启用：B4 在 --require-remote-state 下要求每个
 #   在用模块都必须有远程后端，否则 validate 第一步就红。
 #
-# bucket 要提前存在（Terraform 不会替你建）。当前由 147 的
-# RUNNER_147.local.sh 用机器上已有的 key 变量创建/校验：
+# bucket 由 147 的 RUNNER_147.local.sh 通过 state-bootstrap/ 模块创建：
 #
-#   aliyun oss mb oss://shironeko-wf-tfstate --region cn-hangzhou || true
+#   terraform -chdir=state-bootstrap apply
 #
+# 状态锁：**不配 OTS**。并发保护由执行器保证 —— runner 的 concurrent = 1，
+#   同一时刻只有一个 job 在 apply。加第二个 runner 之前必须补锁
+#   （tablestore_endpoint + tablestore_table，见 backend.tf.example）。
 # ===========================================================================
 
 terraform {
   backend "oss" {
-    bucket = "shironeko-wf-tfstate"
+    bucket = "cloud-native-demo"
     prefix = "terraform-demo/aliyun-ecs"
     key    = "terraform.tfstate"
     region = "cn-hangzhou"
@@ -21,11 +23,6 @@ terraform {
 
     # --- 服务端加密：state 里有明文凭证，开着成本为零 -------------------
     encrypt = true
-
-    # --- 状态锁（OSS 桶 + OTS 锁表由 state-bootstrap/ 模块创建） --------
-    #   aliyun-ecs 与 vmware-workstation 共用同一把锁表，prefix 不同互不干扰。
-    tablestore_endpoint = "https://wf-tfstate.cn-hangzhou.ots.aliyuncs.com"
-    tablestore_table    = "tflock"
   }
 }
 

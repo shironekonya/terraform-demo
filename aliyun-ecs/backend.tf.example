@@ -10,9 +10,12 @@
 #      2. state 里是明文凭证（ECS user_data、密钥、密码），散落在各人机器上
 #
 # 启用步骤：
-#   1) 创建 OSS Bucket（建议专用，不要和业务共用一个桶）
-#   2) 创建 OTS(TableStore) 实例 + 一张锁表
+#   1) 创建 OSS Bucket（建议专用，不要和业务共用一个桶；
+#      本项目由 state-bootstrap/ 建，桶名 cloud-native-demo）
+#   2) 【可选】创建 OTS(TableStore) 实例 + 一张锁表，配上下面的 tablestore 两行
 #        ★ 锁表必须有名为 `LockID` 的主键，类型 String —— 漏了会报锁失败
+#      本项目当前不配锁（单执行器 concurrent = 1）；
+#      加第二个 runner 之前必须回来补上这一段
 #   3) 本地改这份文件为 backend.tf，填掉下面的 <占位符>
 #   4) terraform init -migrate-state    # 把现有本地 state 搬上去
 #

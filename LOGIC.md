@@ -246,7 +246,7 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 | B1 | `*.tf` 或胶水脚本里调 `ansible-playbook` | 只看会被执行的命令，注释与提示文本不算 |
 | B2 | `ansible/` 里跑 `terraform apply / destroy / import / state rm …` | 只允许只读的 `output / show / plan / validate / fmt / version` |
 | B3 | `resource "kubernetes_deployment"` / `helm_release` / `kubectl_manifest` | 用闭集匹配，不搞「`kubernetes_` 开头就算」 |
-| B4 | `backend "local"`、oss 后端缺 `tablestore_table`、backend 里硬编码凭证 | 没有 backend 块给提示（`--require-remote-state` 时升级为失败） |
+| B4 | `backend "local"`、oss 后端配了 `tablestore_table` 却缺 `tablestore_endpoint`、backend 里硬编码凭证；oss 缺锁表给**提示**（当前并发保护由 runner 的 `concurrent = 1` 承担，加第二个 runner 前必须补锁） | 没有 backend 块给提示（`--require-remote-state` 时升级为失败） |
 | B5 | 脚本里 `open('terraform.tfstate')`、provisioner 里碰 state 文件 | — |
 | B6 | provisioner / 胶水脚本里 `apt-get install`、`systemctl restart` | `user_data` 豁免（那是实例启动配置，只在创建时跑一次） |
 | B7 | 没有流水线定义；TF 与 Ansible 被塞进同一个 job；自动变更 job 既没有人工门也没有限定默认分支；全自动流水线里没有回滚 job；`site.yml` 不带 `--limit`；碰 local 的 job 没有人工放行；解锁开关被悄悄带上；有一键绕过流水线的入口脚本；job 既没有 `tags`、顶层也没有 `default.tags` 兜底 | 对流水线做**文本级**结构检查（不是 GitLab CI 语义解析器），约定 `ansible-playbook` 的调用写在一行里 |
@@ -258,8 +258,10 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 如果连提示文本都算越界，这个检查器第一天就会被无视，然后被删掉。
 
 当前状态：**B1~B9 全部通过**。远程后端已启用：`aliyun-ecs` / `vmware-workstation` 各配了
-`backend.tf`（OSS 桶 + OTS 锁表），桶和锁表由 `state-bootstrap/` 用本地 state 自举一次 ——
-backend 不能用资源创建自己，这是唯一合理的一次性动作（登记在豁免清单里）。
+`backend.tf`（同一个 OSS 桶 `cloud-native-demo`，不同 prefix），桶由 `state-bootstrap/`
+用本地 state 自举一次 —— backend 不能用资源创建自己，这是唯一合理的一次性动作
+（登记在豁免清单里）。**状态锁不配 OTS**：并发保护由 runner 的 `concurrent = 1` 保证
+（同一时刻只有一个 job 在 apply），B4 对此只给提示 —— 加第二个 runner 之前必须补锁。
 
 ### CI/CD 是唯一触发器：把变更收敛成一条路径
 
@@ -410,10 +412,11 @@ exemptions:
 启用步骤（模板已备好，两个模块各一份）：
 
 ```bash
-# 1) 先建两样东西（Terraform 不会替你建）
-#    · 一个专用 OSS Bucket
-#    · 一个 OTS(TableStore) 实例 + 一张锁表
+# 1) 先建底层资源（Terraform 不会替你建）
+#    · 一个专用 OSS Bucket（本项目由 state-bootstrap/ 建，桶名 cloud-native-demo）
+#    · 状态锁（可选）：一个 OTS(TableStore) 实例 + 一张锁表
 #      ★ 锁表必须有一列叫 LockID、类型 String —— 漏了会报锁失败
+#      本项目当前不配锁：单执行器 concurrent = 1，加第二个 runner 前再补
 
 # 2) 启用后端
 cd aliyun-ecs

@@ -880,13 +880,14 @@ def check_b4(root: pathlib.Path, rep: Report) -> None:
                 )
             elif btype == "oss":
                 if not re.search(r"tablestore_table\s*=", body):
-                    rep.fail(
-                        "B4", where, 'backend "oss" 没有配 tablestore_table —— 没有状态锁',
+                    rep.warn(
+                        "B4", where, 'backend "oss" 没有配 tablestore_table —— OSS 后端默认只存不锁',
                         hint=(
-                            "OSS 后端默认只存不锁：两个人同时 apply 依然会互相覆盖。\n"
-                            "加锁需要两件事：一个 OTS(TableStore) 实例 + 一张锁表，\n"
-                            "锁表必须有名为 LockID 的主键、类型 String。\n"
-                            "然后：tablestore_endpoint + tablestore_table 两项都配上。"
+                            "当前并发保护由执行器保证：runner 的 concurrent = 1，\n"
+                            "同一时刻只有一个 job 在 apply。\n"
+                            "**加第二个 runner 之前必须补锁**：一个 OTS(TableStore) 实例\n"
+                            "+ 一张主键为 LockID(String) 的锁表，然后\n"
+                            "tablestore_endpoint + tablestore_table 两项都配上。"
                         ),
                     )
                 elif not re.search(r"tablestore_endpoint\s*=", body):
@@ -2128,10 +2129,10 @@ def selftest() -> int:
         "B4", 1, 0,
     )
     case(
-        "B4 命中：oss 后端没配锁表",
+        "B4 提示：oss 后端没配锁表（并发保护由执行器 concurrent=1 承担）",
         {"m/main.tf": 'terraform {\n  backend "oss" {\n    bucket = "b"\n'
                       '    prefix = "p"\n    key = "k"\n    region = "cn-hangzhou"\n  }\n}\n'},
-        "B4", 1, 0,
+        "B4", 0, 1,
     )
     case(
         "B4 命中：oss 配了锁表但缺 endpoint",
@@ -2148,7 +2149,7 @@ def selftest() -> int:
         "B4", 1, 0,
     )
     case(
-        "B4 放行：oss 后端配齐了锁",
+        "B4 放行：oss 后端配齐了锁（显式选择加锁时不产生提示）",
         {"m/main.tf": 'terraform {\n  backend "oss" {\n    bucket = "b"\n'
                       '    prefix = "p"\n    key = "k"\n    region = "cn-hangzhou"\n'
                       '    encrypt = true\n'

@@ -1,21 +1,26 @@
 # ===========================================================================
-# state-bootstrap —— 用 Terraform 建"远程后端本身"（OSS 桶 + OTS 锁表）
+# state-bootstrap —— 用 Terraform 建"远程后端本身"（OSS 状态桶）
 #
 # 为什么这个模块存在：
-#   aliyun-ecs 和 vmware-workstation 的 backend 需要 OSS 桶 + OTS 锁表，
+#   aliyun-ecs 和 vmware-workstation 的 backend 需要 OSS 桶，
 #   而 Terraform 的 backend 不能用资源去创建自己 —— 这是鸡生蛋。
-#   所以这两个"底层资源"由一个**本地 state** 的迷你模块先建出来。
+#   所以这个"底层资源"由一个**本地 state** 的迷你模块先建出来。
 #
 #   它和 tools/install_runner.sh 是同一种东西：一次性 bootstrap，
 #   建完之后几乎不再运行。也因此登记在 boundaries.yml 的豁免段
 #   （B4 不要求它自己配远程后端 —— 它没有更底层的后端可用了）。
+#
+# 状态锁：**不建 OTS**。并发保护由执行器保证（runner 的 concurrent = 1，
+#   同一时刻只有一个 job 在 apply）。加第二个 runner 之前必须补锁：
+#   建 OTS 实例 + LockID 主键锁表，并在两份 backend.tf 里配上
+#   tablestore_endpoint / tablestore_table（模板见 backend.tf.example）。
 #
 # 用法（147 上，key 变量已收敛到 /root/.wf-aliyun.env）：
 #   set -a; . /root/.wf-aliyun.env; set +a
 #   terraform init && terraform apply
 #
 # state 放哪：本地（./terraform.tfstate）。它自己就是"最底层"，
-#   内容不含敏感值（桶名 + 锁表名），丢了可以重建，撞名会报错而不是覆盖。
+#   内容不含敏感值（桶名），丢了可以重建，撞名会报错而不是覆盖。
 # ===========================================================================
 
 terraform {
@@ -52,31 +57,4 @@ resource "alicloud_oss_bucket" "tfstate" {
   versioning {
     enable = true
   }
-}
-
-# ---------------------------------------------------------------------------
-# 状态锁（OTS / TableStore）
-#
-# 锁表要求：主键必须是 LockID、类型 String —— Terraform OSS 后端写死的约定。
-# 实例名在 region 内唯一；endpoint 由名字推导：https://<name>.<region>.ots.aliyuncs.com
-# ---------------------------------------------------------------------------
-resource "alicloud_ots_instance" "tflock" {
-  name        = var.ots_instance
-  description = "Terraform state 锁（terraform-demo）"
-  accessed_by = "Vpc" # 只许同 region 的 VPC / 云服务访问，公网一律拒绝
-
-  tags = { purpose = "terraform-state-lock" }
-}
-
-resource "alicloud_ots_table" "tflock" {
-  instance_name = alicloud_ots_instance.tflock.name
-  table_name    = var.ots_table
-
-  primary_key {
-    name = "LockID"
-    type = "String"
-  }
-
-  time_to_live     = -1  # 锁记录由 Terraform 自己写/删，不过期
-  max_version      = 1
 }
