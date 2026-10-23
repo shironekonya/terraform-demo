@@ -8,13 +8,22 @@ data "alicloud_zones" "available" {
 locals {
   zone_id = var.zone_id != "" ? var.zone_id : data.alicloud_zones.available.zones[0].id
 
-  # 统一命名前缀：demo-hangzhou-xxx
-  name_prefix = "${var.environment}-${replace(var.region, "-", "")}"
+  # 蓝绿槽位：workspace 名就是槽位名（blue / green）。
+  # 灰度发布靠两个 workspace 各养一套完整资源（VPC/SG/机器互不共享），
+  # 新槽验收通过后销毁旧槽 —— 所以资源名必须带槽位，否则两套 resource
+  # 会在云上撞名（key_pair_name 在一个地域里是唯一的）。
+  # default 工作区禁止部署：流水线（tools/gray_slot.sh）只认 blue/green，
+  # 在 default 里 apply 出来的机器没有任何灰度语义，也没法被流水线回收。
+  wf_slot = terraform.workspace == "default" ? "default" : terraform.workspace
+
+  # 统一命名前缀：demo-hangzhou-<slot>-xxx
+  name_prefix = "${var.environment}-${replace(var.region, "-", "")}-${local.wf_slot}"
 
   common_tags = {
     Environment = var.environment
     ManagedBy   = "Terraform"
     Project     = "cloud-vmware-demo"
+    Slot        = local.wf_slot
   }
 }
 

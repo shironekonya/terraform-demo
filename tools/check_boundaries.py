@@ -39,6 +39,9 @@
     B7  变更的唯一触发器是 CI/CD
         —— B1~B6 说的都是「谁不该碰谁」，但没回答「那到底谁能动手」。
            答案必须是流水线，否则「以谁的本地环境为准」这个问题永远没有答案。
+           2026-10-23 起流水线改成全自动灰度（健康检查不达标自动回滚），
+           人工门撤掉，替代物是两条硬规则：变更 job 必须限定默认分支、
+           流水线必须存在回滚 job。碰本地存量服务器（--limit local）仍要人工门。
 
            检查四件事：
              · 仓库里存在 CI 流水线定义（否则提示；--require-ci 时判失败）
@@ -171,6 +174,11 @@ GITLAB_RESERVED_TOP_KEYS = {
 
 # Terraform 的**变更类**命令（只读的 plan/fmt/validate 不在其中）
 TF_MUTATION_RE = re.compile(r"\bterraform\s+(?:apply|destroy|import|taint|untaint)\b")
+
+# 「限定在默认分支」—— 全自动变更 job 的最低护栏（人工门撤掉之后的替代物）
+DEFAULT_BRANCH_RE = re.compile(
+    r"\$CI_COMMIT_BRANCH\s*==\s*\$CI_DEFAULT_BRANCH"
+)
 
 # Ansible 的触发命令
 ANSIBLE_PLAYBOOK_RE = re.compile(r"\bansible-playbook\b")
@@ -1160,8 +1168,9 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
         hint = (
             "加一个 .gitlab-ci.yml（或 Jenkinsfile / GitHub Actions workflow），\n"
             "把变更收敛成一条路径：git push → 流水线。\n"
-            "结构大致是 validate → plan → apply(manual) → configure(Ansible) → verify，\n"
-            "其中 Terraform 与 Ansible 必须是**两个独立 job**，靠 artifact 传数据。"
+            "结构大致是 validate → apply(自动, 限定默认分支) → configure(Ansible)\n"
+            "→ 健康检查 → cutover/rollback，其中 Terraform 与 Ansible 必须是\n"
+            "**两个独立 job**，靠 artifact 传数据。"
         )
         if rep.require_ci:
             rep.fail("B7", "（仓库根）", message, hint=hint)
@@ -1171,6 +1180,8 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
 
     saw_tf_mutation = False
     saw_ansible = False
+    saw_auto_mutation = False   # 没有 manual 门的 terraform 变更 job（灰度路径）
+    job_names: list[str] = []
 
     for path in ci_files:
         rep.scanned += 1
@@ -1190,6 +1201,8 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
             has_tf_mutation = bool(TF_MUTATION_RE.search(joined))
             has_ansible = bool(ANSIBLE_PLAYBOOK_RE.search(joined))
             has_manual = any(MANUAL_RE.match(ln) for ln in executed)
+            has_branch_rule = bool(DEFAULT_BRANCH_RE.search(joined))
+            job_names.append(job_name)
             # 记录是否有变更类动作
             if has_tf_mutation:
                 saw_tf_mutation = True
@@ -1210,22 +1223,28 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                     ),
                 )
 
-            # ---- ② 变更类动作必须人工放行 -------------------------------
+            # ---- ② 全自动变更的最低护栏 ---------------------------------
+            # 人工门撤掉之后（灰度模型：健康检查不达标自动回滚），
+            # 变更 job 至少要做到两件事之一：
+            #   · 有人工门（when: manual）—— 仍然支持，适合不可逆动作；
+            #   · 限定在默认分支 —— push 触发的自动变更只允许发生在
+            #     受保护的 main 上，feature 分支的 push 不能碰云资源。
             if has_tf_mutation and not has_manual:
-                rep.fail(
-                    "B7", job_where,
-                    "terraform 的变更命令所在 job 没有 when: manual",
-                    hint=(
-                        "一次 push 就改了云上资源，等于流水线替你做了决定。\n"
-                        "apply / destroy 这类动作要写：\n"
-                        "    rules:\n"
-                        "      - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'\n"
-                        "        when: manual\n"
-                        "        allow_failure: false\n"
-                        "顺带一提：apply 应该用 plan 阶段产出的那份 plan 文件，\n"
-                        "而不是重新算一遍 —— 否则人工点的那一下，批准的不是你看见的那份计划。"
-                    ),
-                )
+                if not has_branch_rule:
+                    rep.fail(
+                        "B7", job_where,
+                        "terraform 的变更命令所在 job 既没有 when: manual，也没有限定在默认分支",
+                        hint=(
+                            "全自动变更必须写上分支限定，否则任何人开个分支 push 一下\n"
+                            "就能改云上资源：\n"
+                            "    rules:\n"
+                            "      - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'\n"
+                            "（要人工放行的动作写 when: manual 也行 —— 两者留一个。）\n"
+                            "顺带一提：apply 用 plan 产出的计划文件、destroy 只放在\n"
+                            "cutover/rollback 这类有明确语义的位置，都是好习惯。"
+                        ),
+                    )
+                saw_auto_mutation = True
 
             # ---- ③ 全量入口必须显式限定范围 -----------------------------
             #limit是原始的 ansible-playbook 调用，没有 --limit 选项代表全量入口
@@ -1293,6 +1312,27 @@ def check_b7(root: pathlib.Path, rep: Report) -> None:
                         "名字要和注册时的 --tag-list 一致。"
                     ),
                 )
+
+    # ---- ⑤b 自动变更必须有回滚路径 --------------------------------------
+    # 人工门撤掉之后，"发布失败怎么办"必须有机器可执行的答案。
+    # 流水线里要存在一个名字带 rollback 的 job（或显式调 rollback.yml），
+    # 否则一次失败的 push 只会留下一台没人认领的半成品机器。
+    if saw_auto_mutation:
+        has_rollback_path = any(
+            ("rollback" in n.lower())
+            for n in job_names
+        )
+        if not has_rollback_path:
+            rep.fail(
+                "B7", "（流水线）",
+                "变更 job 全自动执行，但整条流水线里没有回滚 job",
+                hint=(
+                    "人工门撤掉之后，自动回滚就是唯一的安全网。\n"
+                    "至少要有一个 job（名字里带 rollback）负责失败时把环境退回去：\n"
+                    "灰度模型里它就是「销毁刚建的新槽位，旧槽位一直在服务」。\n"
+                    "没有这一步的自动发布，等价于把「改坏了没人管」自动化。"
+                ),
+            )
 
     # ---- ⑥ 流水线只覆盖了一半 ------------------------------------------
     # 接手：流水线只覆盖了一半，说明有变更类动作，但没有 ansible-playbook 调用
@@ -2296,9 +2336,75 @@ def selftest() -> int:
         "B7", 1, 0,
     )
     case(
-        "B7 命中：terraform 变更所在 job 没有 when: manual",
-        # 从规范样例里**只**拿走 manual 那一行
+        "B7 命中：变更 job 自动执行，但整条流水线没有回滚 job（人工门撤了，安全网必须补上）",
+        # 从规范样例里**只**拿走 manual 那一行：apply 变成自动的（且有分支限定），
+        # 命中的是新规则 —— 全自动流水线必须存在回滚 job
         {".gitlab-ci.yml": good_ci.replace("      when: manual\n", "")},
+        "B7", 1, 0,
+    )
+    case(
+        "B7 放行：全自动灰度（变更限定默认分支 + 回滚 job 兜底）",
+        # 灰度形状：apply 自动跑，失败由 rollback job 兜底销毁
+        {".gitlab-ci.yml":
+            "stages:\n"
+            "  - deploy\n"
+            "\n"
+            "default:\n"
+            "  tags:\n"
+            "    - wf-infra\n"
+            "\n"
+            "apply:\n"
+            "  stage: deploy\n"
+            "  rules:\n"
+            "    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'\n"
+            "  script:\n"
+            "    - cd aliyun-ecs && terraform apply -auto-approve\n"
+            "\n"
+            "configure:cloud:\n"
+            "  stage: deploy\n"
+            "  script:\n"
+            "    - cd ansible\n"
+            "    - ansible-playbook playbooks/site.yml --limit cloud\n"
+            "\n"
+            "rollback:new:\n"
+            "  stage: deploy\n"
+            "  when: on_failure\n"
+            "  rules:\n"
+            "    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'\n"
+            "  script:\n"
+            "    - cd aliyun-ecs && terraform destroy -auto-approve\n"},
+        "B7", 0, 0,
+    )
+    case(
+        "B7 命中：自动变更的 job 没有限定默认分支（分支保护是人工门的替代物）",
+        # 有回滚 job、有 ansible job（避免 ⑥ 的半流水线提示），
+        # 唯独 apply 没写 rules —— 命中的是分支限定这一条
+        {".gitlab-ci.yml":
+            "stages:\n"
+            "  - deploy\n"
+            "\n"
+            "default:\n"
+            "  tags:\n"
+            "    - wf-infra\n"
+            "\n"
+            "apply:\n"
+            "  stage: deploy\n"
+            "  script:\n"
+            "    - cd aliyun-ecs && terraform apply -auto-approve\n"
+            "\n"
+            "configure:cloud:\n"
+            "  stage: deploy\n"
+            "  script:\n"
+            "    - cd ansible\n"
+            "    - ansible-playbook playbooks/site.yml --limit cloud\n"
+            "\n"
+            "rollback:new:\n"
+            "  stage: deploy\n"
+            "  when: on_failure\n"
+            "  rules:\n"
+            "    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'\n"
+            "  script:\n"
+            "    - cd aliyun-ecs && terraform destroy -auto-approve\n"},
         "B7", 1, 0,
     )
     case(

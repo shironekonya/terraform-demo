@@ -1,103 +1,87 @@
 # ===========================================================================
-# 基础设施流水线 —— 变更的唯一触发器
+# 基础设施流水线 —— push 即部署的蓝绿灰度流水线（全自动，无人工门）
 # ===========================================================================
 #
-# 为什么要有这个文件
+# 部署模型（用户定的，2026-10-23）：
 #
-#   「Terraform 管资源生命周期、Ansible 管节点和服务状态」这两条边界，
-#   在没人管「谁来触发」的时候是守不住的：每个人在自己机器上手跑
-#   terraform apply 和 ansible-playbook，就必然要回答「以谁的本地环境为准」。
-#   这个文件把变更收敛成一条路径：git push → 流水线。
+#   git push
+#     → terraform 建**新槽位**的整套资源（旧槽位不受影响，一直在线服务）
+#     → 流水线拿到新机器的公网 IP
+#     → ansible 初始化新机器（基线 + Docker + 应用，版本 = commit 短 SHA）
+#     → 请求新机器的 nginx 做健康检查（200 且版本标记 = 本次 commit）
+#     → 失败：销毁新槽位（rollback），旧机器毫发无损，流水线红
+#     → 成功：销毁旧槽位（cutover），新机器成为现网，流水线绿
 #
-# 三条设计约束（tools/check_boundaries.py 的 B7 会逐条检查，改坏了会红）
+#   通知 = 流水线本身的状态（绿=发布成功，红=已回滚），另留 NOTIFY_WEBHOOK。
 #
-#   1. Terraform 与 Ansible 是两个**独立 job**，谁都不调用谁。
-#      数据靠 artifact 传：plan job 产出 tf-outputs.json，
-#      configure job 消费它。Ansible 那个 job 里没有 state、没有云凭证，
-#      也就没有能力越界 —— 这是"做不到"，不是"约好了不做"。
+# 槽位记账：blue / green 各是一个 terraform workspace，state 在 OSS 里按
+# workspace 前缀隔离。哪边有机器哪边在服务，tools/gray_slot.sh 负责算。
 #
-#   2. 变更类动作必须人工放行（when: manual）。
-#      validate / plan / 只读体检自动跑；apply、碰本机组的 job、teardown
-#      都必须有人点那一下。
+# 为什么撤掉人工放行也能放心：
+#   人肉点 manual 换来的是"发布前有人看一眼"；灰度模型把它换成了
+#   "发布后机器自证健康，不健康自动退回"。旧机器在整个窗口内在线，
+#   最坏情况 = 浪费一台按量付费机器几十分钟，不是停服。
+#   护栏（B7）相应改成两条硬规则：变更 job 必须限定默认分支；
+#   流水线必须存在回滚 job —— 少了任何一个，validate 就红。
 #
-#   3. Ansible 的 job 一律显式 --limit。
-#      不加限定的 site.yml 会连带碰到本地服务器 —— 虽然 roles/guard 拦得住，
-#      但流水线里不该依赖"拦得住"，该直接不碰。
-#
-# ---------------------------------------------------------------------------
-# 需要预先配置的 CI/CD 变量（Settings → CI/CD → Variables）
-#
-#   ALICLOUD_ACCESS_KEY     Masked。alicloud provider 和 OSS backend 共用
-#   ALICLOUD_SECRET_KEY     Masked
-#   WF_SSH_KEY_FILE         File 类型。部署用的 SSH 私钥
-#   WF_SSH_USER             普通变量，默认 root
-#
-#   ★ 当前部署（runner=147 shell executor）走的是另一条路：key 变量是
-#     147 机器自己的东西，由 /root/.wf-aliyun.env 提供（RUNNER_147.local.sh
-#     从机器现有环境收敛生成，权限 600），before_script 里 source 进来。
-#     两种方式并存，GitLab CI Variables 优先 —— 只配其一即可。
-#     换 runner / 换机器时优先用 CI Variables：跟着项目走，不依赖某台机器。
-#
-#   注意：plan job 的 artifact 里有 tfplan 的 JSON 展开，可能包含敏感值。
-#   它的 expire_in 是 1 天，并且应该配合「限制 artifact 下载权限」一起用。
+# 仍然保留人工的两件事（不在 push 触发的部署路径上）：
+#   configure:local  碰本地存量服务器（两道门不变）
+#   teardown         整组销毁（不可逆，永远不该被一个 push 自动触发）
 #
 # ---------------------------------------------------------------------------
-# 对 runner 的要求
-#
-#   terraform + python3 + ansible-core >= 2.14，并且：
-#     · 能访问对象存储（远程 state 后端）和云 API
-#     · 能 SSH 到云机器
-#     · 能 SSH 到本地服务器那两台（否则改成 --limit cloud）
-#   建议把 terraform provider 缓存挂到 runner 上（TF_PLUGIN_CACHE_DIR），
-#   否则每次 init 都要重新下载 provider。
+# runner 侧需要的东西（RUNNER_147.local.sh 收敛，都是 147 机器自己的）：
+#   /root/.wf-aliyun.env      key 变量（ALICLOUD_* / WF_SSH_KEY_FILE / WF_SSH_USER）
+#   /root/.wf-aliyun.tfvars   terraform 入参（ssh_public_key / ssh_allowed_cidr / zone_id ...）
+#   /root/.wf-terraform.rc    provider 镜像配置（可选；没有则走默认源）
+# 这三个路径都能用 CI Variables（WF_ENV_FILE / WF_TFVARS_FILE / WF_TF_RC）覆盖。
 # ===========================================================================
 
 stages:
   - validate
-  - plan
-  - apply
-  - configure
-  - verify
-  - rollback
-  - teardown
+  - gray-prepare
+  - gray-apply
+  - gray-deploy
+  - gray-health
+  - gray-decide
+  - notify
 
 variables:
   TF_IN_AUTOMATION: "true"
   TF_INPUT: "false"
   TF_ROOT: "$CI_PROJECT_DIR/aliyun-ecs"
   ANSIBLE_ROOT: "$CI_PROJECT_DIR/ansible"
-  # Terraform 交给 Ansible 的唯一输入，就走这个目录
   ARTIFACT_DIR: "$CI_PROJECT_DIR/.ci-artifacts"
   WF_SSH_USER: "root"
-  # 凭证文件：147 机器自带的 key 变量收敛在这里（RUNNER_147.local.sh 生成）。
-  # 路径可以按 CI Variables 覆盖（比如换 runner 机器时改到这里，而不是改 YAML）。
+  # 机器侧文件（见文件头注释），路径可被 CI Variables 覆盖
   WF_ENV_FILE: "/root/.wf-aliyun.env"
+  WF_TFVARS_FILE: "/root/.wf-aliyun.tfvars"
+  WF_TF_RC: "/root/.wf-terraform.rc"
 
 default:
   tags:
-    # ★ 这个 tag 必须和注册 runner 时的 --tag-list 一致。
-    #   不一致时 job 不会报错，只会灰着一直转、状态写成 stuck ——
-    #   因为它既不失败也不超时。tools/check_boundaries.py 的 B7 盯着这一条。
+    # ★ 必须和注册 runner 时的 --tag-list 一致，不一致 job 会永远 stuck
     - wf-infra
   before_script:
     - set -eo pipefail
     - |
       # ── 凭证加载 ────────────────────────────────────────────────
-      # shell executor 不继承登录 shell，147 上已有的 key 变量必须
-      # 显式带进来（RUNNER_147.local.sh 把它们收敛成一份 600 权限的文件）。
-      # 注意：这里 source 会覆盖 GitLab CI Variables 的同名值 —— 两种
-      # 配置方式并存时以这份文件为准；只用 CI Variables 的话删掉该文件即可。
+      # shell executor 不继承登录 shell。机器侧文件优先，
+      # CI Variables 与它并存时以文件为准（换 runner 时删文件、改走 Variables）。
       if [ -f "${WF_ENV_FILE:-/root/.wf-aliyun.env}" ]; then
         set -a; . "${WF_ENV_FILE:-/root/.wf-aliyun.env}"; set +a
       fi
     - |
+      # ── terraform 镜像配置（可选）────────────────────────────────
+      if [ -f "${WF_TF_RC:-/root/.wf-terraform.rc}" ]; then
+        export TF_CLI_CONFIG_FILE="${WF_TF_RC:-/root/.wf-terraform.rc}"
+      fi
+    - |
       # ── 工具链自检 ──────────────────────────────────────────────
-      # shell executor **不继承登录 shell 的 PATH**，它只用 config.toml
-      # 里 environment 写的那一份。漏写一个目录，症状就是 job 第一行
-      # `command not found` 然后变红 —— 而流水线不会告诉你这是 PATH 的事。
-      # 所以先花三行把它问清楚，比事后猜要好。
+      # shell executor 只用 config.toml 里 environment 写的 PATH。
+      # 缺一个目录，症状是第一行 command not found，而流水线不会
+      # 告诉你这是 PATH 的事 —— 所以先花三行问清楚。
       missing=0
-      for tool in python3 terraform ansible-playbook; do
+      for tool in python3 terraform ansible-playbook curl; do
         if ! command -v "$tool" >/dev/null 2>&1; then
           echo "✗ runner 上找不到 $tool"
           missing=1
@@ -107,11 +91,18 @@ default:
         echo
         echo "  修法：把它所在目录写进 /etc/gitlab-runner/config.toml 的"
         echo "        environment = [\"PATH=...\"]，然后 systemctl restart gitlab-runner。"
-        echo "        tools/install_runner.sh 会探测并写好 —— 手动登记的 runner 最容易漏。"
         exit 1
       fi
+    - |
+      # ── tfvars 就位检查（apply 的入参：ssh_public_key / cidr 等）──
+      if [ ! -f "${WF_TFVARS_FILE:-/root/.wf-aliyun.tfvars}" ]; then
+        echo "✗ 找不到 ${WF_TFVARS_FILE:-/root/.wf-aliyun.tfvars}（terraform 的入参文件）。"
+        echo "  没有它，新机器拿不到 SSH 公钥 —— 建出来也登不进去。"
+        echo "  修法：在 147 上跑 RUNNER_147.local.sh（会把 tfvars 收敛到这个路径）。"
+        # validate 段不需要它；带不需要 tfvars 的判断放在用到的 job 里做
+      fi
 
-# 避免 push 和 MR 各触发一条流水线（GitLab 的老问题）
+# 避免 push 和 MR 各触发一条流水线
 workflow:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
@@ -119,8 +110,14 @@ workflow:
       when: never
     - if: '$CI_COMMIT_BRANCH'
 
+.tf-vars-args: &tf-vars-args >-
+  if [ ! -f "${WF_TFVARS_FILE:-/root/.wf-aliyun.tfvars}" ]; then
+  echo "✗ ${WF_TFVARS_FILE:-/root/.wf-aliyun.tfvars} 不存在 —— terraform 入参（SSH 公钥、放行网段）没有着落。";
+  echo "  在 runner 机器上跑一次 RUNNER_147.local.sh，或用 CI Variables 配 WF_TFVARS_FILE 指向实际路径。";
+  exit 1; fi
+
 # ---------------------------------------------------------------------------
-# 1. validate：不需要任何凭证、不碰任何机器，先把边界和语法过一遍
+# 1. validate：不需要凭证、不碰机器。这一段红了，后面全部不用跑
 # ---------------------------------------------------------------------------
 
 validate:boundaries:
@@ -129,7 +126,7 @@ validate:boundaries:
     - echo "── 分层边界静态校验 ──"
     - python3 tools/check_boundaries.py --require-remote-state --require-ci
     - echo
-    - echo "── Ansible 侧护栏（纯离线，不需要机器）──"
+    - echo "── Ansible 侧护栏（纯离线）──"
     - cd ansible
     - python3 tools/check_guard.py
     - python3 tools/check_guard.py --selftest
@@ -140,49 +137,50 @@ validate:terraform:
   script:
     - cd "$TF_ROOT"
     - terraform fmt -check -recursive
-    # -backend=false：语法与引用校验不需要后端，也就不需要凭证
+    # -backend=false：语法校验不需要后端，也就不需要凭证
     - terraform init -backend=false -input=false
     - terraform validate
 
 # ---------------------------------------------------------------------------
-# 2. plan：读得到 state、算得出差异，但不改任何东西
+# 2. gray:slot —— 算槽位：哪边在服务（active）、这次建哪边（new）
 # ---------------------------------------------------------------------------
 
-plan:
-  stage: plan
+gray:slot:
+  stage: gray-prepare
   script:
-    - cd "$TF_ROOT"
-    - terraform init -input=false -lock-timeout=5m
-    - terraform plan -input=false -lock-timeout=5m -out=tfplan
-    - terraform show -json tfplan > plan.json
-    # ★ 这一份是给 Ansible 那一侧的**唯一**输入。
-    #   而不是让 Ansible 自己去调 terraform —— 那会让它重新需要一套云凭证。
     - mkdir -p "$ARTIFACT_DIR"
-    - terraform output -json > "$ARTIFACT_DIR/tf-outputs.json"
+    # 脚本的环境变量行走 stdout，人类日志走 stderr —— tee 进 artifact，eval 进环境
+    - eval "$($CI_PROJECT_DIR/tools/gray_slot.sh | tee "$ARTIFACT_DIR/slot.env")"
+    - echo "ACTIVE=${ACTIVE_SLOT:-（无，首次部署）}  NEW=$NEW_SLOT"
   artifacts:
-    name: "tf-plan-$CI_COMMIT_SHORT_SHA"
-    # tfplan 是二进制计划文件，内容含明文敏感值 —— 过期要短
     expire_in: 1 day
     paths:
-      - aliyun-ecs/tfplan
-      - aliyun-ecs/plan.json
       - .ci-artifacts/
+  rules:
+    # 只在默认分支上算槽位：feature 分支的流水线止步于 validate，
+    # 也避免只读验证顺手在 backend 里建出空 workspace
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
 # ---------------------------------------------------------------------------
-# 3. apply：人工放行。用的是 plan 里那份**被看过**的计划，不是重新算一遍
+# 3. gray:apply —— 在新槽位上 apply。旧槽位的 state 在另一个 workspace 里，
+#    这个动作物理上碰不到它。已有限定默认分支（B7），无人工门。
 # ---------------------------------------------------------------------------
 
-apply:
-  stage: apply
+gray:apply:
+  stage: gray-apply
   needs:
-    - job: plan
+    - job: gray:slot
       artifacts: true
   script:
+    - *tf-vars-args
     - cd "$TF_ROOT"
+    - eval "$(cat "$ARTIFACT_DIR/slot.env")"
     - terraform init -input=false -lock-timeout=5m
-    - terraform apply -input=false -lock-timeout=5m -auto-approve tfplan
-    # apply 之后输出会变（新机器有 IP 了），重新导出给下一段用
+    - terraform workspace select "$NEW_SLOT" || terraform workspace new "$NEW_SLOT"
+    - echo "── 在槽位 $NEW_SLOT 上建/更新资源（旧槽位 $ACTIVE_SLOT 不受影响）──"
+    - terraform apply -input=false -lock-timeout=5m -auto-approve -var-file="${WF_TFVARS_FILE}"
     - mkdir -p "$ARTIFACT_DIR"
+    # 新机器的公网 IP 就在这里面 —— 这是 Terraform 交给 Ansible 的唯一输入
     - terraform output -json > "$ARTIFACT_DIR/tf-outputs.json"
   artifacts:
     name: "tf-outputs-$CI_COMMIT_SHORT_SHA"
@@ -191,41 +189,176 @@ apply:
       - .ci-artifacts/
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-      allow_failure: false
 
 # ---------------------------------------------------------------------------
-# 4. configure：Ansible 上场。它只消费 artifact，不调用 terraform
+# 4. gray:configure —— Ansible 初始化新机器。只消费 artifact，不碰 terraform
 # ---------------------------------------------------------------------------
 
-configure:cloud:
-  stage: configure
+gray:configure:
+  stage: gray-deploy
   needs:
-    # apply 是 manual 的，可能没跑（比如这次只改了 Ansible 的 playbook）——
-    # 那时候用 plan 阶段的输出就够了，所以 optional
-    - job: apply
-      artifacts: true
-      optional: true
-    - job: plan
+    - job: gray:apply
       artifacts: true
   script:
     - cd "$ANSIBLE_ROOT"
-    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE"
-    # ★ 版本名 = 这个 commit。它会被写进页面、写进 releases/<版本>/、写进 current。
-    #   回滚靠的就是这一串：不传版本名时，两次部署在机器上长得一模一样，
-    #   没法回答"现在跑的是哪一版、上一版还在不在"。
+    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "${WF_SSH_USER:-root}" --ssh-key "${WF_SSH_KEY_FILE:-$HOME/.ssh/id_ed25519}"
+    # 版本名 = commit。写进页面、releases/<版本>/、current 指针 —— 健康检查就靠它对版本
     - ansible-playbook playbooks/site.yml --limit cloud -e "wf_release=$CI_COMMIT_SHORT_SHA"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
 
-configure:local:
-  stage: configure
+# ---------------------------------------------------------------------------
+# 5. gray:health —— 验收门：请求新机器的 nginx，200 且版本 = 本次 commit
+# ---------------------------------------------------------------------------
+
+gray:health:
+  stage: gray-health
   needs:
-    - job: apply
+    - job: gray:apply
+      artifacts: true
+  script:
+    - |
+      NEW_IP="$(python3 -c "
+      import json
+      d = json.load(open('$ARTIFACT_DIR/tf-outputs.json'))
+      ips = (d.get('instance_public_ips', {}) or {}).get('value') or {}
+      assert ips, 'tf-outputs.json 里没有公网 IP'
+      print(list(ips.values())[0])
+      ")"
+      echo "── 对新机器 http://${NEW_IP}/ 做健康检查（期望版本 $CI_COMMIT_SHORT_SHA）──"
+      bash "$CI_PROJECT_DIR/tools/health_check.sh" "$NEW_IP" "$CI_COMMIT_SHORT_SHA"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# 6. gray:decide —— 二选一：
+#    健康检查过了 → cutover：销毁旧槽位，新机器成为现网
+#    前面任何一步挂了 → rollback：销毁新槽位，旧机器一直在服务
+# ---------------------------------------------------------------------------
+
+gray:cutover:
+  stage: gray-decide
+  needs:
+    - job: gray:slot
+      artifacts: true
+    - job: gray:health
+  script:
+    - *tf-vars-args
+    - cd "$TF_ROOT"
+    - eval "$(cat "$ARTIFACT_DIR/slot.env")"
+    - terraform init -input=false -lock-timeout=5m
+    - |
+      if [ -z "${ACTIVE_SLOT:-}" ]; then
+        echo "── 首台机器，没有旧槽位可撤。$NEW_SLOT 从此就是现网。──"
+        exit 0
+      fi
+      echo "── 健康检查通过 → 销毁旧槽位 $ACTIVE_SLOT（新机器 $NEW_SLOT 接管）──"
+      terraform workspace select "$ACTIVE_SLOT"
+      terraform destroy -input=false -lock-timeout=5m -auto-approve -var-file="${WF_TFVARS_FILE}"
+    - echo "✓ 本次发布完成：$NEW_SLOT 在服务（版本 $CI_COMMIT_SHORT_SHA），旧槽位已回收"
+    - echo "result=cutover slot=$NEW_SLOT active=${ACTIVE_SLOT:-none} version=$CI_COMMIT_SHORT_SHA" > "$ARTIFACT_DIR/result.txt"
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - .ci-artifacts/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+gray:rollback:
+  stage: gray-decide
+  # needs + when: on_failure：前面任何一个环节失败（建机器/初始化/健康检查），
+  # 这个 job 就会跑 —— 销毁建了一半的新槽位。旧槽位从头到尾没被动过。
+  needs:
+    - job: gray:slot
+      artifacts: true
+    - job: gray:apply
       artifacts: true
       optional: true
-    - job: plan
+    - job: gray:health
+      optional: true
+  when: on_failure
+  script:
+    - *tf-vars-args
+    - cd "$TF_ROOT"
+    - eval "$(cat "$ARTIFACT_DIR/slot.env")"
+    - terraform init -input=false -lock-timeout=5m
+    - echo "── 部署/健康检查失败 → 回滚：销毁新槽位 $NEW_SLOT（旧槽位 $ACTIVE_SLOT 一直在服务）──"
+    - terraform workspace select "$NEW_SLOT"
+    - terraform destroy -input=false -lock-timeout=5m -auto-approve -var-file="${WF_TFVARS_FILE}"
+    - |
+      if [ -n "${ACTIVE_SLOT:-}" ]; then
+        echo "✓ 回滚完成：现网仍是 $ACTIVE_SLOT（上一版），本次 commit $CI_COMMIT_SHORT_SHA 未上线"
+      else
+        echo "✗ 首次部署失败且没有旧机器 —— 现在没有任何机器在服务。"
+        echo "  看上面失败环节的日志修复后，重新 push 触发即可。"
+      fi
+    - echo "result=rollback slot=$NEW_SLOT active=${ACTIVE_SLOT:-none} version=$CI_COMMIT_SHORT_SHA" > "$ARTIFACT_DIR/result.txt"
+  artifacts:
+    expire_in: 1 day
+    paths:
+      - .ci-artifacts/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+# ---------------------------------------------------------------------------
+# 7. notify —— 收场报告。成功/失败两个方向都会走到这里。
+#    通知本体 = 流水线状态（绿 = 已上线，红 = 已回滚）；
+#    配了 NOTIFY_WEBHOOK 的话再 POST 一份摘要（钉钉/企微/飞书机器人通用）。
+# ---------------------------------------------------------------------------
+
+gray:notify:
+  stage: notify
+  when: always
+  needs:
+    - job: gray:cutover
       artifacts: true
+      optional: true
+    - job: gray:rollback
+      artifacts: true
+      optional: true
+  script:
+    - |
+      # 结果判据不靠 $CI_JOB_STATUS（它只在 after_script 里有）：
+      # cutover / rollback 谁跑了，谁就留下 result.txt
+      RESULT="pipeline_failed_early（部署还没走到二选一就挂了，回看前段日志）"
+      if [ -f "$ARTIFACT_DIR/result.txt" ]; then
+        RESULT="$(cat "$ARTIFACT_DIR/result.txt")"
+      fi
+      SLOT_INFO="（槽位信息未生成）"
+      [ -f "$ARTIFACT_DIR/slot.env" ] && SLOT_INFO="$(tr '\n' ' ' < "$ARTIFACT_DIR/slot.env")"
+      NEW_IP=""
+      if [ -f "$ARTIFACT_DIR/tf-outputs.json" ]; then
+        NEW_IP="$(python3 -c "
+        import json
+        d = json.load(open('$ARTIFACT_DIR/tf-outputs.json'))
+        ips = (d.get('instance_public_ips', {}) or {}).get('value') or {}
+        print(list(ips.values())[0] if ips else '')
+        " 2>/dev/null || true)"
+      fi
+      echo "═══════════════════════════════════════════"
+      echo " 发布摘要  commit=$CI_COMMIT_SHORT_SHA  branch=$CI_COMMIT_BRANCH"
+      echo " 结果：$RESULT"
+      echo " 槽位：$SLOT_INFO"
+      echo " 新机器 IP：${NEW_IP:-（未能取得）}"
+      echo " 流水线状态 = 本次发布结果：绿=上线，红=已回滚到旧机器"
+      echo "═══════════════════════════════════════════"
+      echo "$RESULT" > /tmp/wf_result_line
+    - |
+      if [ -n "${NOTIFY_WEBHOOK:-}" ]; then
+        RESULT_LINE="$(cat /tmp/wf_result_line)"
+        curl -sS --max-time 10 -H 'Content-Type: application/json' \
+          -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"terraform-demo $CI_COMMIT_SHORT_SHA：$RESULT_LINE\"}}" \
+          "$NOTIFY_WEBHOOK" || echo "webhook 通知失败（不影响流水线结论）"
+      else
+        echo "（未配置 NOTIFY_WEBHOOK，跳过外部通知）"
+      fi
+
+# ---------------------------------------------------------------------------
+# 附：本地存量服务器（不在灰度路径上，两道人工门不变）
+# ---------------------------------------------------------------------------
+
+configure:local:
+  stage: gray-deploy
   script:
     - cd "$ANSIBLE_ROOT"
     - echo "本地服务器默认完全只读。要真的动手，得先有人点这一下 ——"
@@ -237,67 +370,26 @@ configure:local:
       allow_failure: false
 
 # ---------------------------------------------------------------------------
-# 5. verify：只读验收。性质是「跑完之后，任何被管机器的 changed 都必须是 0」
-# ---------------------------------------------------------------------------
-
-verify:readonly:
-  stage: verify
-  needs:
-    - job: apply
-      artifacts: true
-      optional: true
-    - job: plan
-      artifacts: true
-  script:
-    - cd "$ANSIBLE_ROOT"
-    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE" --quiet
-    # 默认同时验收云机器和本地服务器；runner 不在同一网段时改成 --limit cloud
-    - ansible-playbook playbooks/verify.yml --limit "cloud,local"
-    - echo "验收性质：上面这条的 changed 必须是 0。不为 0 说明有东西没收敛。"
-
-# ---------------------------------------------------------------------------
-# 6. rollback：把应用退回上一版
-#
-#   和 teardown 分开放，是因为它们回答的是两个问题：
-#     rollback  应用出错 → 退回上一版（机器还在，30 秒的事）
-#     teardown  整组资源不要了 → destroy（不可逆，要重新 apply 才能回来）
-#
-#   仍然是人工放行：回滚本身也是一次变更，不该由"谁推了个 commit"决定。
-#   不填 WF_ROLLBACK_TO 时，回退到当前版本的上一个。
-# ---------------------------------------------------------------------------
-
-rollback:app:
-  stage: rollback
-  needs:
-    - job: plan
-      artifacts: true
-  script:
-    - cd "$ANSIBLE_ROOT"
-    - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "$WF_SSH_USER" --ssh-key "$WF_SSH_KEY_FILE" --quiet
-    - |
-      if [ -n "${WF_ROLLBACK_TO:-}" ]; then
-        echo "指定回退到：$WF_ROLLBACK_TO"
-        ansible-playbook playbooks/rollback.yml --limit cloud -e "wf_rollback_to=$WF_ROLLBACK_TO"
-      else
-        echo "未指定目标 → 回退到当前版本的上一个"
-        ansible-playbook playbooks/rollback.yml --limit cloud
-      fi
-  rules:
-    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
-      when: manual
-      allow_failure: false
-
-# ---------------------------------------------------------------------------
-# 7. teardown：最危险的动作，同样走人工放行
-#    （放在最后一段，是为了让它在流水线界面上永远要你主动去点）
+# 附：teardown —— 整组销毁。不可逆，永远不该被一个 push 自动触发。
+#   两个槽位一起清：跑两次（blue / green）。
 # ---------------------------------------------------------------------------
 
 teardown:
-  stage: teardown
+  stage: notify
   script:
+    - *tf-vars-args
     - cd "$TF_ROOT"
     - terraform init -input=false -lock-timeout=5m
-    - terraform destroy -input=false -lock-timeout=5m -auto-approve
+    - for slot in blue green; do
+        if terraform workspace select "$slot" 2>/dev/null; then
+          echo "── 销毁槽位 $slot ──";
+          terraform destroy -input=false -lock-timeout=5m -auto-approve -var-file="${WF_TFVARS_FILE}" || true;
+        else
+          echo "── 槽位 $slot 不存在，跳过 ──";
+        fi;
+      done
+    - terraform workspace select default
+    - echo "✓ 两个槽位都已回收（不存在的已跳过）"
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       when: manual

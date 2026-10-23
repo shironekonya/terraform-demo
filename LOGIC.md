@@ -234,7 +234,7 @@ terraform-demo/
 
 ```bash
 python3 tools/check_boundaries.py                      # 9 条边界逐条报状态
-python3 tools/check_boundaries.py --selftest           # 证明这个检查器真的会响（67 个用例）
+python3 tools/check_boundaries.py --selftest           # 证明这个检查器真的会响（69 个用例）
 python3 tools/check_boundaries.py --require-remote-state   # CI 用：没有远程后端直接失败
 python3 tools/check_boundaries.py --require-ci             # CI 用：没有流水线定义直接失败
 ```
@@ -249,7 +249,7 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 | B4 | `backend "local"`、oss 后端缺 `tablestore_table`、backend 里硬编码凭证 | 没有 backend 块给提示（`--require-remote-state` 时升级为失败） |
 | B5 | 脚本里 `open('terraform.tfstate')`、provisioner 里碰 state 文件 | — |
 | B6 | provisioner / 胶水脚本里 `apt-get install`、`systemctl restart` | `user_data` 豁免（那是实例启动配置，只在创建时跑一次） |
-| B7 | 没有流水线定义；TF 与 Ansible 被塞进同一个 job；变更动作没有人工放行；`site.yml` 不带 `--limit`；碰 local 的 job 没有人工放行；解锁开关被悄悄带上；有一键绕过流水线的入口脚本；job 既没有 `tags`、顶层也没有 `default.tags` 兜底 | 对流水线做**文本级**结构检查（不是 GitLab CI 语义解析器），约定 `ansible-playbook` 的调用写在一行里 |
+| B7 | 没有流水线定义；TF 与 Ansible 被塞进同一个 job；自动变更 job 既没有人工门也没有限定默认分支；全自动流水线里没有回滚 job；`site.yml` 不带 `--limit`；碰 local 的 job 没有人工放行；解锁开关被悄悄带上；有一键绕过流水线的入口脚本；job 既没有 `tags`、顶层也没有 `default.tags` 兜底 | 对流水线做**文本级**结构检查（不是 GitLab CI 语义解析器），约定 `ansible-playbook` 的调用写在一行里 |
 | B8 | 代码里有跨层调用但没声明；声明写成 `mode: write`；声明的 `to` 不是 terraform；没写 `why`；声明了但代码里找不到（腐烂）；声明文件用了子集之外的写法 | 严格的最小 YAML 子集解析，遇到不认识的写法**报错而不是猜** |
 | B9 | `resource "vsphere_virtual_machine"`、`provider "vsphere"`、`source = "hashicorp/vsphere"`；`vmrun` / `vmware-cmd` / `vmware-vdiskmanager` 调用；`.vmx` / `.vmdk` 路径；豁免清单里没写 `why`、或登记了不存在的路径 | 命令类只在**执行上下文**里找（`error_message = "找不到 vmrun.exe"` 是提示文本，不算）；豁免判据是**清单**，不是目录名 |
 
@@ -257,41 +257,45 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 「提示用户去装 python3」的 `echo`，里面就含 `apt-get install` ——
 如果连提示文本都算越界，这个检查器第一天就会被无视，然后被删掉。
 
-当前状态：**B1 / B2 / B3 / B5 / B6 / B7 / B8 / B9 通过；B4 有 2 条提示**（两个在用模块还没有配远程后端，
-见下一节）。这一点是诚实的：`backend.tf.example` 已经写好放在各模块里，但**没有替你启用** ——
-因为启用它需要先有 OSS 桶和 OTS 锁表，凭空打开只会让 `terraform init` 直接失败。
+当前状态：**B1~B9 全部通过**。远程后端已启用：`aliyun-ecs` / `vmware-workstation` 各配了
+`backend.tf`（OSS 桶 + OTS 锁表），桶和锁表由 `state-bootstrap/` 用本地 state 自举一次 ——
+backend 不能用资源创建自己，这是唯一合理的一次性动作（登记在豁免清单里）。
 
 ### CI/CD 是唯一触发器：把变更收敛成一条路径
 
 B1~B6 说的都是「谁不该碰谁」，但没回答**那到底谁能动手**。答案是流水线 ——
 否则「以谁的本地环境为准」这个问题永远没有答案：每个人手跑的那次都算数。
 
-`.gitlab-ci.yml` 是这台仓库里唯一能改动环境的路径：
+`.gitlab-ci.yml` 是这台仓库里唯一能改动环境的路径。**2026-10-23 起是全自动蓝绿灰度**（用户定的模型）：
 
 ```
-validate ──→ plan ──→ apply(人工放行) ──→ configure ──→ verify
-   │           │                           │
-   │           └─ 产出 artifact ───────────┘
-   │              tf-outputs.json
-   └─ 边界校验 + 语法校验（不需要凭证，也不碰机器）
+git push
+  → gray:slot     算槽位：哪边有机器哪边在服务（active），这次建另一边（new）
+  → gray:apply    在新槽位整套建资源 —— 旧槽位在另一个 workspace 里，物理碰不到
+  → gray:configure  ansible 初始化新机器（版本 = commit 短 SHA）
+  → gray:health   请求新机器的 nginx：200 且 <meta wf-release> = 本次 commit
+  → gray:cutover  过了 → 销毁旧槽位，新机器成为现网
+     gray:rollback 没过 → 销毁新槽位（when: on_failure），旧机器毫发无损
+  → gray:notify   收场报告（通知本体 = 流水线状态；可配 NOTIFY_WEBHOOK）
 ```
 
-六个 stage、八个 job，其中三条设计约束是刻意的：
+槽位记账：**blue / green 各是一个 terraform workspace**（OSS state 按 workspace 前缀隔离），
+资源名带槽位后缀（`name_prefix` 里拼 `terraform.workspace`，否则两套资源的 key pair 会撞名）。
+七个 stage、十一个 job，设计约束是刻意的：
 
 > **别和 [阶段三](#阶段三--cicd-流水线) / [阶段四](#阶段四--gitlab-流水线入口) 搞混。**
 > 那两阶段管的是**应用交付**链路（Harbor webhook → Jenkins 部署），
 > Terraform 在里面只负责声明「Harbor 项目 / webhook / Jenkins 任务」这些**配置对象**。
 >
-> 这里的 `.gitlab-ci.yml` 是另一回事：它跑的是**基础设施自身的变更**
-> （`terraform plan/apply` 与 `ansible-playbook`）。
+> 这里的 `.gitlab-ci.yml` 是另一回事：它跑的是**基础设施自身的变更**。
 > 两条流水线都跟 GitLab 有关，但一条改的是**应用**，一条改的是**环境** ——
 > 而且它们**不能互相调用**，否则就又回到「谁对状态负责」说不清的局面。
 > 这也是为什么 B7 会检查「TF 与 Ansible 不在同一个 job 里」，
 > 而不是只检查「有没有流水线」。
 
 **① Terraform 与 Ansible 是两个独立 job，谁都不调用谁。**
-数据靠 artifact 传递：`plan` / `apply` job 把 `terraform output -json` 存成
-`.ci-artifacts/tf-outputs.json`，`configure` job 用
+数据靠 artifact 传递：`gray:apply` job 把 `terraform output -json` 存成
+`.ci-artifacts/tf-outputs.json`，`gray:configure` 用
 `gen_cloud_inventory.py --from-output-json` 消费它。这样 Ansible 那个 job 里
 **没有 state、没有云凭证** —— 越界不是「约好了不做」，而是**做不到**。
 
@@ -299,18 +303,22 @@ validate ──→ plan ──→ apply(人工放行) ──→ configure ──
 等于要求 Ansible 那一侧也拿到整套 Terraform 权限。改成 artifact 之后，
 CI 里的跨层调用数降到了 **0**。
 
-**② 变更类动作必须人工放行。** `validate` / `plan` 和只读体检自动跑；
-`apply`、任何碰本地机器的 job、`teardown` 都必须有人点那一下（`when: manual`）。
-`apply` 用的还是 `plan` 阶段产出的那份 `tfplan`，不是重新算一遍 ——
-否则人工点的那一下，批准的不是你看见的那份计划。
+**② 全自动变更的两条硬护栏。** 人工门撤掉了 —— 但不是白撤：人肉点 manual 买到的是
+"发布前有人看一眼"，灰度模型把它换成"发布后机器自证健康，不健康自动退回"，
+旧机器整个窗口在线，最坏损失是几十分钟的按量付费。替代人工门的是 B7 的两条硬规则：
+
+- **变更 job 必须限定默认分支** —— feature 分支的 push 不能碰云资源；
+- **流水线必须存在回滚 job** —— 自动发布没有安全网，等价于"改坏了没人管"的自动化。
+
+不可逆的动作仍然保留人工门：`teardown`（整组销毁）永远要有人点那一下。
 
 **③ Ansible 的调用一律显式 `--limit`。** 不加限定的 `site.yml` 会同时覆盖
 `cloud` 和 `local` 两组。本地服务器虽然被 `roles/guard` 拦着，但流水线里不该依赖
 「拦得住」—— 该直接不碰。碰 `local` 的 job 还要再叠一道 `when: manual`，
 和 Ansible 那侧的 `local_mutation_allowed` 形成**两道门**。
 
-> **这套约束是可执行的**：上面每一条都由 B7 盯着。故意把 `apply` 的 `when: manual`
-> 拿掉、或者给自动跑的 job 悄悄带上解锁开关，B7 会立刻报出来（验证记录见
+> **这套约束是可执行的**：上面每一条都由 B7 盯着。故意把自动变更 job 的分支限定
+> 拿掉、删掉回滚 job、或者给自动跑的 job 悄悄带上解锁开关，B7 会立刻报出来（验证记录见
 > [验证状态](#验证状态)）。
 
 ### 跨层衔接：默认零条，每条都要写出来
@@ -591,7 +599,7 @@ expected_compose = templatefile("${path.module}/templates/jenkins-compose.yaml.t
 
 ```bash
 python3 tools/check_boundaries.py             # 九条边界逐条检查 + 复核 boundaries.yml 的衔接登记
-python3 tools/check_boundaries.py --selftest  # 67 个用例，证明检查器确实会响
+python3 tools/check_boundaries.py --selftest  # 69 个用例，证明检查器确实会响
 ```
 
 `ansible/` 那一层还有三个独立检查（依赖 PyYAML —— 装了 Ansible 的机器上一定有）：
@@ -603,7 +611,7 @@ python3 tools/check_guard.py --selftest  # 13 个用例
 python3 tools/selftest.py                # 离线自测：模板渲染 + 保护公式真值表（16 种开关组合）
 ```
 
-判据：前两条输出「通过」与「自证通过：67 个用例」，后三条不出现 `✗`。
+判据：前两条输出「通过」与「自证通过：69 个用例」，后三条不出现 `✗`。
 
 > CI 里跑的是更严格的一档：`python3 tools/check_boundaries.py --require-remote-state --require-ci`。
 > 它把「已有远程 state」「已声明 CI 入口」也算作必须满足的条件，而这两项在本地首次跑时本来就不满足，
@@ -1748,7 +1756,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 （在一台 Ubuntu 26.04 / ansible-core 2.21.4 的 Linux 机器上完整跑过五幕，
 用 WSL 主机同时扮演 `cloud` 组和 `local` 组的受管机）。
 
-#### 第一段：静态 + 离线（166 项断言 + 19 个校验器自证用例，全部通过）
+#### 第一段：静态 + 离线（167 项断言 + 19 个校验器自证用例，全部通过）
 
 | 验证项 | 做法 | 结果 |
 |---|---|---|
@@ -1809,7 +1817,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 
 ↑ 曾经还有一条「B9 与豁免清单只在 Windows 上跑过」，**这一条已经补上**：2026-09-30 在
 同一台 Linux（Ubuntu 26.04 / Python 3.14.4）上把边界检查器完整复跑了一遍 ——
-67 个自证用例、142 个文件的全量扫描、以及 8 个破坏性场景（含改名脱离豁免那条），
+69 个自证用例、142 个文件的全量扫描、以及 8 个破坏性场景（含改名脱离豁免那条），
 结果与 Windows 侧**逐项一致**（同名场景命中数 1 / 1 / 1 / 8 / 1 / 29 / 0+提示）。
 运行前先核对过两侧文件指纹：`boundaries.yml`、`check_boundaries.py`、`README.md`、
 `.gitlab-ci.yml`、`ansible.cfg` 五个文件的 sha1 完全相同，所以「在 Linux 上验过」这句话
@@ -1818,7 +1826,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 ### `tools/` 分层边界的验证状态
 
 边界检查器 `check_boundaries.py` 的验证方式是「静态 + 自证 + 对真实仓库做破坏性验证」，
-共 **67 个自证用例**，全部通过。它**只用标准库**
+共 **69 个自证用例**，全部通过。它**只用标准库**
 （`argparse` / `pathlib` / `re` / `shutil` / `tempfile`），不依赖 yaml，也不依赖 Ansible。
 
 | 验证项 | 做法 | 结果 |
@@ -1827,7 +1835,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 | **该放的放得开** | `--selftest`：23 个「应当放行」用例 | ✓ 见下 |
 | ↑ 放行类里最关键的几个 | 注释里的 `ansible-playbook` / `kubectl` / `tfstate`；`echo` 提示文本里的 `apt-get install`；Python 文档字符串里的 `systemctl`；`user_data` 里的 `dnf install`；`kubernetes_namespace` / `kubernetes_nodes`；一份**规范的流水线** | ✓ 全部不误报 —— **误报率决定这类工具能不能活下去** |
 | **反向验证（跨工具）** | `subprocess.run(['terraform','apply'])` vs `terraform output -json` | ✓ 前者命中 B2，后者放行 |
-| **反向验证（B7 的七条子规则）** | 从一份规范流水线出发，**每次只改一处**：拿掉 `when: manual` / 去掉 `--limit` / `--limit` 换成 `local` / 给自动 job 带上解锁开关 / 把 TF 与 Ansible 塞进同一个 job / 加一个 `deploy.sh` / 去掉 `tags` 兜底 | ✓ 每一条都各自命中，改一处只响一处 |
+| **反向验证（B7 的子规则）** | 从一份规范流水线出发，**每次只改一处**：拿掉 `when: manual`（命中：缺回滚 job）/ 去掉分支限定（命中）/ 删掉回滚 job（命中）/ 去掉 `--limit` / `--limit` 换成 `local` / 给自动 job 带上解锁开关 / 把 TF 与 Ansible 塞进同一个 job / 加一个 `deploy.sh` / 去掉 `tags` 兜底 | ✓ 每一条都各自命中，改一处只响一处 |
 | **反向验证（B8 的六条子规则）** | 未登记 / `mode: write` / `to: ansible` / 缺 `why` / 引号未闭合 / 顶层多一个键 | ✓ 同上；且解析失败**只报一次**（不叠加一条假的「没写 why」） |
 | **反向验证（B9 的三类痕迹 + 豁免机制）** | 三类痕迹各来一遍：`resource "vsphere_virtual_machine"` / `provider "vsphere"` 与 `source = "hashicorp/vsphere"` / `.vmx` 路径 / `vmrun` 调用（Terraform、Python、Ansible、shell 各一种）；放行类：`error_message = "找不到 vmrun.exe"`、`vmrun_path` 变量名、注释与 `.md` 文档。豁免机制正反各一遍：同样的违规代码，登记过豁免就放行、没登记就报 | ✓ 12 个命中/提示、7 个放行全部符合预期；豁免那组是**唯一变量**对照（同文件同内容，只在清单里加一行），所以响了就一定是豁免机制在起作用 |
 | **B8 / B9 不重复报账** | 构造一个「顶层多了个键 + exemptions 段」的文件，只看 B9 | ✓ B9 报 0 —— 顶层结构错归属 B8。**同一条错误被两条规则各报一遍**是这次重构差点留下的坑：解析是全文一次做完的，不给错误标上归属就会出现「一个毛病、两条报告」 |
@@ -1874,7 +1882,7 @@ export TF_CLI_CONFIG_FILE="$(pwd)/terraform.rc"
 
 - ~~检查器只在 Windows 的 Python 3.13 / 3.15 上跑过~~ —— **2026-09-30 已补上**。
   同一份代码（五个关键文件 sha1 两侧一致）在一台真实 Linux（Ubuntu 26.04 / Python 3.14.4）
-  上复跑：67 个自证用例全过、142 个文件全量扫描九条边界全绿、上表 S6–S12 那 8 个破坏性场景
+  上复跑：69 个自证用例全过、142 个文件全量扫描九条边界全绿、上表 S6–S12 那 8 个破坏性场景
   再走一遍，命中数与 Windows 侧**逐项相同**（1 / 1 / 1 / 8 / 1 / 29 / 0+提示），
   每个场景还原后还做了逐字节核对
 - 边界检查是**静态的**：它证明「代码里没有越界的写法」，不证明「运行时各工具真的没抢对象」

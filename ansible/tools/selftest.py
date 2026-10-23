@@ -656,18 +656,24 @@ def test_release_rollback() -> None:
     check("rollback.yml：roles 列表里没有 dict 写法（tasks_from 会被静默忽略）",
           all(isinstance(r, str) for r in roles), roles)
 
-    # ---- CI 入口 -----------------------------------------------------------
+    # ---- CI 入口（2026-10-23 起是全自动灰度：健康检查失败自动销毁新槽位）----
     ci = yaml.safe_load((ROOT.parent / ".gitlab-ci.yml").read_text(encoding="utf-8"))
-    check("CI 有独立的 rollback 阶段", "rollback" in (ci.get("stages") or []), ci.get("stages"))
-    job = ci.get("rollback:app") or {}
-    check("rollback:app 是人工放行", any(r.get("when") == "manual" for r in job.get("rules") or []),
-          job.get("rules"))
-    check("rollback:app 调的是 playbooks/rollback.yml",
-          any("playbooks/rollback.yml" in str(line) for line in job.get("script") or []), job.get("script"))
+    check("CI 有灰度二选一阶段（gray-decide）",
+          "gray-decide" in (ci.get("stages") or []), ci.get("stages"))
+    rb = ci.get("gray:rollback") or {}
+    check("gray:rollback 是自动触发（when: on_failure，人工门已撤）",
+          rb.get("when") == "on_failure", rb.get("when"))
+    check("gray:rollback 回滚动作 = 销毁新槽位（terraform destroy）",
+          any("terraform destroy" in str(line) for line in rb.get("script") or []),
+          rb.get("script"))
     check("部署 job 会把 commit 当版本名传下去",
           any("wf_release=$CI_COMMIT_SHORT_SHA" in str(line)
-              for line in (ci.get("configure:cloud") or {}).get("script") or []),
-          (ci.get("configure:cloud") or {}).get("script"))
+              for line in (ci.get("gray:configure") or {}).get("script") or []),
+          (ci.get("gray:configure") or {}).get("script"))
+    check("gray:health 是验收门（调 health_check.sh）",
+          any("health_check.sh" in str(line)
+              for line in (ci.get("gray:health") or {}).get("script") or []),
+          (ci.get("gray:health") or {}).get("script"))
 
 
 def test_image_preflight() -> None:
