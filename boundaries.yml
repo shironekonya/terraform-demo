@@ -87,3 +87,5 @@ exemptions:
     why: "语法参考：vSphere 官方 provider 的写法，供以后真要迁到 vCenter/ESXi 时对照。需要 vCenter 才能 init，本项目不用它。因此不作为「在用模块」检查（也就不需要 backend），不参与运行。"
   - path: tools/install_runner.sh
     why: "CI 执行器自身的引导脚本（一次性 bootstrap，跑完即退出运行路径）。它装包、起服务，正是 B6 说的「机器内部状态」—— 但这里做不到交给 Ansible：脚本装的是**运行 Ansible 的那台机器的 runner**，鸡生蛋问题，执行器无法由自己的流水线安装自己。装完之后，runner 主机上的任何进一步变更仍归 Ansible（且它在 local 组，默认只读）。因此登记为豁免，而不是让 B6 的提示长期挂着、慢慢变成背景噪音。"
+  - path: state-bootstrap
+    why: "创建远程后端自身的最小模块：OSS 状态桶 + OTS 锁表（aliyun-ecs 与 vmware-workstation 的 backend 依赖它们）。backend 不能用资源创建自己 —— 鸡生蛋，所以这个模块用本地 state 自举，与 tools/install_runner.sh 同属一次性 bootstrap。B4 不要求它配远程后端（它没有更底层可用）；建完之后只在调整后端资源时手动运行，不进流水线。state 丢失可重建（内容只有桶名和锁表名，无敏感值）。"

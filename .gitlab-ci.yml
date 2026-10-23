@@ -32,6 +32,12 @@
 #   WF_SSH_KEY_FILE         File 类型。部署用的 SSH 私钥
 #   WF_SSH_USER             普通变量，默认 root
 #
+#   ★ 当前部署（runner=147 shell executor）走的是另一条路：key 变量是
+#     147 机器自己的东西，由 /root/.wf-aliyun.env 提供（RUNNER_147.local.sh
+#     从机器现有环境收敛生成，权限 600），before_script 里 source 进来。
+#     两种方式并存，GitLab CI Variables 优先 —— 只配其一即可。
+#     换 runner / 换机器时优先用 CI Variables：跟着项目走，不依赖某台机器。
+#
 #   注意：plan job 的 artifact 里有 tfplan 的 JSON 展开，可能包含敏感值。
 #   它的 expire_in 是 1 天，并且应该配合「限制 artifact 下载权限」一起用。
 #
@@ -63,6 +69,9 @@ variables:
   # Terraform 交给 Ansible 的唯一输入，就走这个目录
   ARTIFACT_DIR: "$CI_PROJECT_DIR/.ci-artifacts"
   WF_SSH_USER: "root"
+  # 凭证文件：147 机器自带的 key 变量收敛在这里（RUNNER_147.local.sh 生成）。
+  # 路径可以按 CI Variables 覆盖（比如换 runner 机器时改到这里，而不是改 YAML）。
+  WF_ENV_FILE: "/root/.wf-aliyun.env"
 
 default:
   tags:
@@ -72,6 +81,15 @@ default:
     - wf-infra
   before_script:
     - set -eo pipefail
+    - |
+      # ── 凭证加载 ────────────────────────────────────────────────
+      # shell executor 不继承登录 shell，147 上已有的 key 变量必须
+      # 显式带进来（RUNNER_147.local.sh 把它们收敛成一份 600 权限的文件）。
+      # 注意：这里 source 会覆盖 GitLab CI Variables 的同名值 —— 两种
+      # 配置方式并存时以这份文件为准；只用 CI Variables 的话删掉该文件即可。
+      if [ -f "${WF_ENV_FILE:-/root/.wf-aliyun.env}" ]; then
+        set -a; . "${WF_ENV_FILE:-/root/.wf-aliyun.env}"; set +a
+      fi
     - |
       # ── 工具链自检 ──────────────────────────────────────────────
       # shell executor **不继承登录 shell 的 PATH**，它只用 config.toml

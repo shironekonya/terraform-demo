@@ -34,7 +34,7 @@
 
 ## 接流水线（本地 GitLab）
 
-Runner 装在**已经有工具链的那台**（本项目是 `192.168.193.147`：terraform + ansible + ECS 私钥），
+Runner 装在**已经有工具链和 key 变量的那台**（本项目是 `192.168.193.147`：terraform + ansible + ECS 私钥 + 阿里云凭证），
 用 shell executor——`.gitlab-ci.yml` 里的 job 靠 `tags: [wf-infra]` 找到它。
 
 ```bash
@@ -43,9 +43,16 @@ sudo GITLAB_URL=http://192.168.193.139:8000 \
      ./tools/install_runner.sh
 ```
 
-然后三件必须在 GitLab 侧做的事：Runner 变绿（online，tag=`wf-infra`）、
-配 CI/CD Variables（`ALICLOUD_ACCESS_KEY` / `ALICLOUD_SECRET_KEY` Masked、`WF_SSH_KEY_FILE` File 类型）、
-该机器上的工作区保持干净（shell executor 直接在 `$CI_PROJECT_DIR` 里跑）。
+配套两件事（一次性 bootstrap，都在 147 上）：
+
+- **key 变量收敛**：shell executor 不继承登录 shell，机器上已有的 key 变量要收敛成
+  `/root/.wf-aliyun.env`（权限 600），CI 的 `before_script` 会 source 它；
+  也可以改用 GitLab CI Variables（两种并存时这份文件优先）。
+- **远程 state 的底层资源**：`state-bootstrap/` 模块创建 OSS 状态桶 + OTS 锁表
+  （backend 不能用资源创建自己，鸡生蛋，所以自举），它在 `boundaries.yml` 登记豁免。
+
+Runner 起来后 push 任意提交（包括空提交），流水线即触发：`validate` 两个 job 不需要云凭证，
+应当先绿；`plan/apply` 需要 key 变量收敛成功 + 后端资源就位。
 
 完整的取舍（为什么是 shell 而不是 docker executor、为什么 `concurrent = 1`、
 为什么 runner 不上 GitLab 那台）写在 [`LOGIC.md`](LOGIC.md)。
