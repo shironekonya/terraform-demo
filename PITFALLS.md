@@ -941,7 +941,37 @@ plan 直接报两条错：`The argument "status" is required` + `An argument nam
 **改了参数名**而不报 deprecated —— validate 阶段能拦住的错，永远不要让它流到 147 上才炸。
 （本地有 provider 缓存的话，`terraform validate` 半分钟就能验完这段。）**
 
-## 这 55 条怎么分布
+### 第 56 条：OSS 桶名是跨账号全局唯一的，"名字被占"不等于"我没有"
+
+**现象**：`alicloud_oss_bucket` 报
+`The specified bucket name: "cloud-native-demo" is not available. The bucket namespace is shared by all users of the OSS system.`
+
+**原因**：OSS 的桶名空间全站共享（所有账号、所有 region 一个池子），
+`CreateBucket` 对**任何已存在的桶**都返回这句 —— 包括**你自己账号里已经建过的那个**。
+所以这条报错有两种完全不同的含义，处理方式相反：
+
+| 桶属于谁 | 正确处理 |
+|---|---|
+| 自己账号（之前手工建过） | `terraform import` 接管，别重建（重建必然失败） |
+| 别人 / 另一个 region | 换一个带后缀的名字，四处同步 |
+
+**修法**：bootstrap 里先探一次再决定
+（`https://<bucket>.oss-<region>.aliyuncs.com`：403 = 存在且私有，404 = 不存在）：
+
+```bash
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+        "https://${BUCKET}.oss-${REGION}.aliyuncs.com" || true)"
+if [ "${CODE}" = "403" ]; then
+  terraform import -input=false alicloud_oss_bucket.tfstate "${BUCKET}" || {
+    echo "不属于本账号，换名"; exit 1; }
+fi
+terraform apply -auto-approve -input=false   # 再把版本化/加密对齐
+```
+
+**规律：全局命名空间的资源，"创建失败"这条路径上必须有一个 import 分支。
+不然每次报错都在逼你做选择题，而选择题的两个答案往往都是错的。**
+
+## 这 56 条怎么分布
 
 | 轮次 | 主题 | 条目 | 条数 |
 |---|---|---|---|
@@ -962,6 +992,7 @@ plan 直接报两条错：`The argument "status" is required` + `An argument nam
 | 第十五轮 | 发布与回滚 | 50–51 | 2 |
 | 第十六轮 | 流水线驱动发布/回滚 | 52–53 | 2 |
 | 第十七轮 | 147 真跑 bootstrap：runner 注册与 provider 版本 | 54–55 | 2 |
+| 第十八轮 | 全局命名的资源：桶名被占 | 56 | 1 |
 
 轮次不是按时间堆的，是按**模块**分的 —— 每一轮解决一个模块的问题，
 所以第 7 轮（Ansible）条目最多：那一层的失败模式最不容易在本地复现。
