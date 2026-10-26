@@ -54,7 +54,8 @@ resource "alicloud_oss_bucket" "tfstate" {
   }
 
   # 防误删：state 一丢，destroy 不掉的"幽灵资源"就只能手工清理了
+  # （新 provider 用 status 而不是 enable —— 字段名跟着 provider 走）
   versioning {
-    enable = true
+    status = "Enabled"
   }
 }

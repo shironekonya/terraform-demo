@@ -62,22 +62,25 @@ else
   [[ -n "$RUNNER_TOKEN" ]] || die "没有 RUNNER_TOKEN：GitLab → Settings → CI/CD → Runners 里取一个"
 
   # 两种 token 的传参位置不同，混用会得到一句很含糊的 "invalid token"。
+  # 另一处差异：glrt-（authentication token）模式下 tag/locked/access-level 等
+  # 配置**只能在 GitLab 服务端改**（建 runner 的地方），register 命令带这些参数
+  # 会直接 FATAL —— 所以旧式 registration-token 才传，glrt- 一律不传。
   if [[ "$RUNNER_TOKEN" == glrt-* ]]; then
     TOKEN_FLAG="--token"
+    EXTRA_ARGS=()
   else
     TOKEN_FLAG="--registration-token"
+    EXTRA_ARGS=(--tag-list "$RUNNER_TAG" --run-untagged=false --locked=false)
   fi
 
-  say "注册 runner（tag=${RUNNER_TAG}，executor=shell）"
+  say "注册 runner（executor=shell，token 类型：${RUNNER_TOKEN:0:5}…）"
   gitlab-runner register --non-interactive \
     --url "$GITLAB_URL" \
     "$TOKEN_FLAG" "$RUNNER_TOKEN" \
     --executor shell \
     --shell bash \
     --description "$RUNNER_DESC" \
-    --tag-list "$RUNNER_TAG" \
-    --run-untagged=false \
-    --locked=false
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 fi
 
 # ---------------------------------------------------------------------------

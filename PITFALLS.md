@@ -903,7 +903,45 @@
     任务组织方式（include / roles_dict / tasks_from），都要回头问一句：
     静态检查的眼睛跟到那里了吗？—— 这次两条新自证用例就是答案的证据。**
 
-## 这 53 条怎么分布
+## 第十七轮：在 147 上第一次真跑 bootstrap（2026-10-26）
+
+### 第 54 条：glrt- token 注册 runner，配置参数会直接 FATAL
+
+**现象**：`gitlab-runner register --token glrt-… --tag-list wf-infra --run-untagged=false`
+报 `FATAL: Runner configuration other than name and executor configuration is reserved …
+cannot be specified when registering with a runner authentication token`。
+
+**原因**：GitLab 新版 runner 创建流程里有两种 token，权限模型完全不同：
+
+| | 旧式 registration token | 新式 authentication token（glrt-） |
+|---|---|---|
+| tag / locked / run-untagged 等在哪定 | 注册命令行 | **GitLab 服务端**（建 runner 的地方 / API） |
+| register 能带哪些参数 | 全部 | 只有 name / executor / url / token |
+
+我们的 runner 是走 API 建的（`POST /user/runners`，tag_list 已在服务端设好），
+所以拿到的必然是 glrt- —— 注册命令里那三个参数不是"多余"，是**不允许**。
+
+**修法**：install_runner.sh 按 token 前缀分流，glrt- 只传 url/token/executor/shell/description。
+
+**规律：同一个工具的同一个命令，token 类型一换，合法参数集就变。
+报错文本把"哪些参数被保留"列得很全，但只有真的撞过才知道它是终结性的。**
+
+### 第 55 条：alicloud provider 的 versioning 块用 status，不是 enable
+
+**现象**：`alicloud_oss_bucket` 里写 `versioning { enable = true }`，
+plan 直接报两条错：`The argument "status" is required` + `An argument named "enable" is not expected`。
+
+**原因**：alicloud provider 某个大版本把 versioning 块的布尔开关改成了
+`status = "Enabled" | "Suspended"`（对齐 AWS S3 的写法）。网上大量教程还是旧写法，
+照抄就在新 provider 上翻车 —— 而我们锁了 `>= 1.210`，必然是新写法。
+
+**修法**：`versioning { status = "Enabled" }`。
+
+**规律：Terraform 的错误定位给到行号时是最便宜的错；贵的是 provider 在两个大版本间
+**改了参数名**而不报 deprecated —— validate 阶段能拦住的错，永远不要让它流到 147 上才炸。
+（本地有 provider 缓存的话，`terraform validate` 半分钟就能验完这段。）**
+
+## 这 55 条怎么分布
 
 | 轮次 | 主题 | 条目 | 条数 |
 |---|---|---|---|
@@ -923,6 +961,7 @@
 | 第十四轮 | 真机验失败路径 | 48–49 | 2 |
 | 第十五轮 | 发布与回滚 | 50–51 | 2 |
 | 第十六轮 | 流水线驱动发布/回滚 | 52–53 | 2 |
+| 第十七轮 | 147 真跑 bootstrap：runner 注册与 provider 版本 | 54–55 | 2 |
 
 轮次不是按时间堆的，是按**模块**分的 —— 每一轮解决一个模块的问题，
 所以第 7 轮（Ansible）条目最多：那一层的失败模式最不容易在本地复现。
