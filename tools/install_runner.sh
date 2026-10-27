@@ -145,6 +145,16 @@ gitlab-runner install --user root --working-directory /root/gitlab-runner 2>/dev
 systemctl enable --now gitlab-runner
 sleep 2
 
+# runner 若以 root 跑（override 或 --user root），而 builds 目录还属于旧用户
+# （系统包默认 gitlab-runner），git 会报 "detected dubious ownership" 直接 128 ——
+# gray:apply 死在拉代码，离真因十万八千里。root 跑 runner 就全局放行。
+if [ "$(ps -o user= -C gitlab-runner 2>/dev/null | head -1)" = "root" ]; then
+  git config --global --get-all safe.directory 2>/dev/null | grep -qx "*" || {
+    git config --global --add safe.directory "*"
+    say "root 运行 -> git safe.directory 全局放行（builds 目录属旧用户时的坑）"
+  }
+fi
+
 say "服务状态"
 systemctl is-active gitlab-runner
 gitlab-runner verify 2>&1 | tail -5
