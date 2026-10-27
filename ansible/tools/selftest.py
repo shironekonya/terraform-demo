@@ -955,6 +955,62 @@ def test_inventory_generator() -> None:
     empty = yaml.safe_load(gen.render([], "", "root", ""))
     check("没有可用实例时也能生成合法清单", isinstance(empty, dict), gen.render([], "", "root", ""))
 
+    # ── known_hosts 清理：IP 被回收复用时，旧键会让 ssh 直接拒连 ──
+    #
+    # 这不是"锦上添花"的功能，是蓝绿灰度的必需项：每发布一次就 destroy 一台、
+    # 建一台，新机器大概率复用旧 IP，而控制端的 known_hosts 里还留着上一台的键
+    # → 第一幕 Gathering Facts 就 UNREACHABLE。所以这里测的是"真能删掉且不误伤"。
+    import base64 as _b64
+    import hashlib as _hashlib
+    import hmac as _hmac
+    import tempfile
+
+    def _hashed(host: str) -> str:
+        """按 ssh 的 HashKnownHosts 算法造一条哈希记录。"""
+        salt = b"0123456789abcdefghij"
+        digest = _hmac.new(salt, host.encode(), _hashlib.sha1).digest()
+        return "|1|{}|{}".format(
+            _b64.b64encode(salt).decode(), _b64.b64encode(digest).decode()
+        )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        kh = pathlib.Path(tmpdir) / "known_hosts"
+        kh.write_text(
+            "\n".join(
+                [
+                    "121.41.199.199 ssh-ed25519 AAAAPLAIN",          # 要清（明文）
+                    "[121.41.199.199]:2222 ssh-rsa AAAABRACKET",     # 要清（带端口）
+                    f"{_hashed('121.41.199.199')} ssh-ed25519 AAAAHASH",  # 要清（哈希）
+                    "10.0.0.5 ssh-ed25519 AAAALOCAL",               # 不能动（不在本批）
+                    "121.41.199.1990 ssh-ed25519 AAAASIMILAR",      # 不能动（前缀像而已）
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        removed = gen.purge_known_hosts(["121.41.199.199"], kh)
+        left = kh.read_text(encoding="utf-8").splitlines()
+        check("known_hosts：明文 / 带端口 / 哈希 三种写法都清掉了", len(removed) == 3, removed)
+        check(
+            "known_hosts：不在本批的主机一个没动",
+            any("AAAALOCAL" in ln for ln in left),
+            left,
+        )
+        check(
+            "known_hosts：只是前缀相似的地址没被误删",
+            any("AAAASIMILAR" in ln for ln in left),
+            left,
+        )
+        check("known_hosts：清完仍是 2 行（没有把文件清空）", len(left) == 2, left)
+        check(
+            "known_hosts：重复跑一次是幂等的（返回空、文件不变）",
+            gen.purge_known_hosts(["121.41.199.199"], kh) == []
+            and kh.read_text(encoding="utf-8").splitlines() == left,
+        )
+        check("known_hosts：文件不存在时不报错、返回空", gen.purge_known_hosts(["1.2.3.4"], pathlib.Path(tmpdir) / "nope") == [])
+        check("known_hosts：地址清单为空时直接返回，不碰文件", gen.purge_known_hosts([], kh) == [])
+
+
 
 def test_guard_truth_table() -> None:
     """对「本地服务器不覆盖」的保护公式做真值表验证。

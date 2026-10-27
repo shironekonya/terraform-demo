@@ -10,8 +10,11 @@
     1. 拿到 terraform output -json 的结果（两种取法，见下）
     2. 读 summary 输出（每台实例的 name / private_ip / public_ip / instance_type）
     3. 生成 cloud 组的清单文件
+    4. 顺手清掉这些 IP 在控制端 known_hosts 里的旧主机键
+       （IP 会被回收复用，不清就卡在第一幕 Gathering Facts，见 purge_known_hosts）
 
 只读：不碰任何云资源，也不改 Terraform 的 state。
+（第 4 步只动控制端自己的 ~/.ssh/known_hosts，且只动本次刚建出来的这些 IP。）
 
 ---------------------------------------------------------------------------
 两种取数方式：本地手工 vs 流水线
@@ -44,6 +47,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
+import hashlib
+import hmac
 import json
 import pathlib
 import re
@@ -211,6 +218,98 @@ def render(inventory: list[dict], region: str, user: str, ssh_key: str) -> str:
     return "\n".join(out)
 
 
+def _host_key_matches(entry: str, host: str) -> bool:
+    """known_hosts 里的一行是不是属于 host。
+
+    三种写法都要认，少认一种就等于"清理了但没清掉"：
+
+        plain       47.98.12.34 ssh-ed25519 AAAA...
+        bracketed   [47.98.12.34]:2222 ssh-ed25519 AAAA...
+        hashed      |1|<salt_b64>|<hmac_b64> ssh-ed25519 AAAA...
+
+    最后一种是 HashKnownHosts 的默认产物（Ubuntu/Debian 默认开），
+    肉眼完全看不出里面是哪个 IP，只能按同样算法算一遍再比对：
+        digest = base64( HMAC-SHA1(salt, hostname) )
+    """
+    try:
+        names = entry.split()[0].split(",")
+    except IndexError:
+        return False
+
+    for name in names:
+        if name.startswith("|1|"):
+            try:
+                _, _, salt_b64, digest_b64 = name.split("|")
+                salt = base64.b64decode(salt_b64 + "=" * (-len(salt_b64) % 4))
+                want = hmac.new(salt, host.encode(), hashlib.sha1).digest()
+                got = base64.b64decode(digest_b64 + "=" * (-len(digest_b64) % 4))
+            except (ValueError, binascii.Error):
+                continue
+            if hmac.compare_digest(want, got):
+                return True
+        elif name.startswith("["):
+            # [host]:port —— 带端口时方括号是必写的，去掉才是地址本身
+            if name.split("]")[0].lstrip("[") == host:
+                return True
+        elif name == host:
+            return True
+    return False
+
+
+def purge_known_hosts(hosts: list[str], path: pathlib.Path) -> list[str]:
+    """清掉这些地址在 known_hosts 里的旧主机键，返回清掉的条目头。
+
+    ── 为什么必须清 ──
+    公网 IP 会被回收再分配。destroy 之后重建，新机器大概率拿到上一台
+    用过的 IP，而控制端的 known_hosts 里还留着**上一台机器**的键，于是：
+        @@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@
+        Offending ECDSA key in /root/.ssh/known_hosts:18
+    Ansible 判 UNREACHABLE，卡在第一幕的 Gathering Facts —— 报错看着像
+    "连不上"或"被中间人攻击"，实际只是记账本过期了。
+    而蓝绿灰度天生每发布一次就 destroy 一台、建一台，所以这不是偶发，
+    是每次都会撞上的常态。
+
+    ── 为什么可以安全地清 ──
+    传进来的 IP 是**本次刚 terraform apply 出来的**，它们对应的上一台机器
+    已经被销毁、私钥也随之消失，旧记录没有任何"认机器"的价值。
+    删掉之后由 accept-new 重新记一份新键，信任起点跟着挪到新机器上。
+    清单之外的主机（本地存量服务器等）一律不动 —— 不搞"关掉校验"那套。
+    """
+    path = path.expanduser()
+    target = {h.strip() for h in hosts if h and h.strip()}
+    if not target or not path.is_file():
+        return []
+
+    try:
+        original = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        mode = path.stat().st_mode & 0o777
+    except OSError as exc:
+        print(f"  ⚠ 读不了 {path}（{exc}），跳过主机键清理", file=sys.stderr)
+        return []
+
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in original:
+        head = line.split()[0] if line.strip() else ""
+        if head and not line.lstrip().startswith("#") and any(_host_key_matches(line, h) for h in target):
+            removed.append(head)
+            continue
+        kept.append(line)
+
+    if not removed:
+        return []
+
+    # 先写临时文件再原子替换：中途失败不会把 known_hosts 留成半截
+    tmp = path.with_name(path.name + ".wf-tmp")
+    tmp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+    try:
+        tmp.chmod(mode)
+    except OSError:
+        pass
+    tmp.replace(path)
+    return removed
+
+
 def main(argv: list[str] | None = None) -> int:
     here = pathlib.Path(__file__).resolve().parent
     default_module = (here.parent.parent / "aliyun-ecs").resolve()
@@ -237,6 +336,16 @@ def main(argv: list[str] | None = None) -> int:
         help="允许把没有公网 IP 的实例也写进去（需要跳板机才能连；默认跳过并提示）",
     )
     parser.add_argument("--quiet", action="store_true", help="只输出结果，不打过程")
+    parser.add_argument(
+        "--known-hosts",
+        default="~/.ssh/known_hosts",
+        help="控制端的 known_hosts 路径（默认 ~/.ssh/known_hosts）",
+    )
+    parser.add_argument(
+        "--no-purge-known-hosts",
+        action="store_true",
+        help="不清理这些 IP 的旧主机键（默认清理，见 purge_known_hosts 的说明）",
+    )
     args = parser.parse_args(argv)
 
     module_dir = pathlib.Path(args.module_dir).resolve()
@@ -280,6 +389,24 @@ def main(argv: list[str] | None = None) -> int:
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(render(usable, region, args.user, args.ssh_key), encoding="utf-8")
+
+    # 清单出来的同一刻就把这些 IP 的旧主机键清掉。
+    # 顺序有意如此：先确认这批 IP 是"本次的"，再动 known_hosts。
+    if not args.no_purge_known_hosts and usable:
+        known_hosts = pathlib.Path(args.known_hosts)
+        gone = purge_known_hosts(
+            [i["public_ip"] or i["private_ip"] for i in usable], known_hosts
+        )
+        if gone:
+            print(
+                f"  ✓ 清掉 {len(gone)} 条过期主机键（{known_hosts.expanduser()}）：{', '.join(gone)}",
+                file=sys.stderr,
+            )
+            print(
+                "      原因：公网 IP 被回收复用，旧机器的键会让 ssh 报 "
+                "HOST IDENTIFICATION CHANGED",
+                file=sys.stderr,
+            )
 
     if not args.quiet:
         print(f"  ✓ 已写入 {out_path}（{len(usable)} 台）")
