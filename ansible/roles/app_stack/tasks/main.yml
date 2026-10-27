@@ -184,7 +184,59 @@
         - (wf_stack_image_probe.rc | default(1)) != 0
         - (wf_stack_image_tar | length) == 0
 
-    # 三件事合起来回答一个问题：现在能不能 up -d。
+    # -----------------------------------------------------------------------
+    # ★ 兜底：daemon.json 里的 registry-mirrors 未必真的在起作用
+    #
+    #   docker 只在**启动时**读一次 daemon.json。而 docker_engine 里那句
+    #   `systemctl restart docker` 是 failed_when: false（不能因为重启失败把
+    #   整幕带走），于是存在一个夹缝：文件里写了镜像站、`docker info` 也复核过、
+    #   可 pull 依旧 i/o timeout —— 因为守护进程其实没换过配置。
+    #
+    #   这条路不依赖守护进程配置：把仓库名直接换成镜像站前缀去拉，拉下来再按
+    #   原名打 tag，compose 那份文件一个字都不用改。
+    #
+    #   ★ 只在 group_vars 里**已声明**的镜像站之间试，不做任何自动发现 ——
+    #     "用谁的机器拉镜像"是使用者写在配置里的决定，不是 role 该猜的。
+    #   ★ 镜像名第一段带 `.` 或 `:` 说明它来自别的 registry（不是 Docker Hub），
+    #     镜像站改写会 404，这种情况直接跳过，别浪费一轮超时。
+    # -----------------------------------------------------------------------
+    - name: "app_stack · 直连失败 → 依次试已声明的镜像站（拉到后回打原名）"
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          img="{{ wf_stack_image }}"
+          repo="${img%%@*}"          # 去掉 @sha256: 摘要，只留 名字:标签
+          case "${repo}" in
+            */*) head="${repo%%/*}" ;;   # 有斜杠才可能有 registry 段
+            *)   head="" ;;
+          esac
+          case "${head}" in
+            *.*|*:*) echo "SKIP 镜像不在 Docker Hub（registry 段是 ${head}），镜像站改写没有意义"
+                     exit 3 ;;
+          esac
+          if [ -z "${head}" ]; then path="library/${repo}"; else path="${repo}"; fi
+          for m in {{ wf_docker_registry_mirrors | join(' ') }}; do
+            m="${m#http://}"; m="${m#https://}"; m="${m%/}"   # 只留 host，docker 自己补协议
+            [ -z "${m}" ] && continue
+            echo "── 试 ${m}/${path}"
+            if timeout {{ wf_stack_pull_timeout }} docker pull "${m}/${path}"; then
+              docker tag "${m}/${path}" "${img}"
+              echo "OK ${m}/${path} → ${img}"
+              exit 0
+            fi
+          done
+          echo "✗ 已声明的镜像站都没拉下来"
+          exit 1
+      register: wf_stack_mirror_pull
+      changed_when: (wf_stack_mirror_pull.rc | default(1)) == 0
+      failed_when: false
+      when:
+        - (wf_stack_image_probe.rc | default(1)) != 0
+        - (wf_stack_pull.rc | default(1)) != 0
+        - (wf_stack_image_tar | length) == 0
+        - (wf_docker_registry_mirrors | length) > 0
+
+    # 四件事合起来回答一个问题：现在能不能 up -d。
     # check 模式下一律当"能"，否则一次干跑会因为"没拉过镜像"而报错 ——
     # 干跑的意义是看会改什么，不是验证网络。
     - name: "app_stack · 判定镜像是否就位"
@@ -193,6 +245,7 @@
           {{ ((wf_stack_image_probe.rc | default(1)) == 0)
              or ((wf_stack_image_load.rc | default(1)) == 0)
              or ((wf_stack_pull.rc | default(1)) == 0)
+             or ((wf_stack_mirror_pull.rc | default(1)) == 0)
              or ansible_check_mode }}
 
     # 拉不到的时候顺手把「这台机器够得着谁」测出来。
@@ -493,8 +546,13 @@
       {% for line in (wf_stack_pull.stderr_lines | default([]))[-4:] %}        {{ line }}
       {% endfor %}
       {% endif %}
+      {% if wf_stack_mirror_pull is defined and wf_stack_mirror_pull.stdout is defined %}
+      已声明的镜像站也逐个试过了（wf_docker_registry_mirrors）：
+      {% for line in (wf_stack_mirror_pull.stdout_lines | default([]))[-6:] %}        {{ line }}
+      {% endfor %}
+      {% endif %}
       {% if wf_stack_mirror_probe is defined and wf_stack_mirror_probe.results %}
-      从这台机器探测各镜像站（HTTP 码，000 = 连不上）：
+      从这台机器探测各镜像站（HTTP 码，000 = 连不上；401 = 要认证，属正常）：
       {% for r in wf_stack_mirror_probe.results %}        {{ r.item }} → {{ (r.stdout | default('') | trim) or '000（超时/无 curl）' }}
       {% endfor %}
       {% endif %}
@@ -508,6 +566,8 @@
              - https://xxxxxxxx.mirror.aliyuncs.com
          然后重跑：docker_engine 会写 daemon.json 并重启 docker，
          还会自己复核加速器有没有真的生效（写进文件 ≠ 生效）。
+         ★ 本仓库当前预填的是两个**实测可达**的第三方站（见 cloud.yml 注释），
+           生产环境请换成自己账号的 ACR 加速器。
 
       2) 用离线镜像包（网络整段不通时，唯一可靠的办法）
          在有网的机器上：

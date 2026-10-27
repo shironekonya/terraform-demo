@@ -71,4 +71,21 @@ wf_docker_log_max_file: "3"
 # ★ 注意：registry-mirrors 只对 **Docker Hub** 的镜像生效。
 #   镜像名里带了别的 registry（如 registry.cn-hangzhou.aliyuncs.com/xxx）
 #   就会绕过它 —— 那种情况靠加速器救不了，得换镜像或走离线包。
-wf_docker_registry_mirrors: []
+#
+# ★★ 下面这两条是「本 demo 的默认值」，不是通用推荐：
+#
+#   2026-10-27 在 ECS 上实测 registry-1.docker.io 不可达
+#   （`dial tcp 104.244.46.186:443: i/o timeout`，域名被解析到了完全无关的地址），
+#   而这两个第三方站从这台机器**真的能拉到** nginx:alpine
+#   （从外部做了完整的 registry 认证 + manifest 校验：/v2/ 返回 401 要 token、
+#   取到 token 后 manifest 返回 200、16 个架构 —— 401 只是"要认证"，不是"没有"）。
+#
+#   生产环境请换成自己账号的 ACR 加速器（地址在「容器镜像服务 → 镜像工具 →
+#   镜像加速器」），把下面两行替换掉即可；不想经过任何第三方就用离线包
+#   （app_stack 的 wf_stack_image_tar）。
+#
+#   ★ 这一行是**使用者的决定**，不是 role 自动探测出来的：app_stack 的兜底
+#     只会试这个列表里已声明的地址，不会自己去找别的站。
+wf_docker_registry_mirrors:
+  - https://docker.m.daocloud.io
+  - https://docker.1ms.run
