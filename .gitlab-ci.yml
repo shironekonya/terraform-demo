@@ -342,10 +342,14 @@ gray:notify:
       echo " 新机器 IP：${NEW_IP:-（未能取得）}"
       echo " 流水线状态 = 本次发布结果：绿=上线，红=已回滚到旧机器"
       echo "═══════════════════════════════════════════"
-      echo "$RESULT" > /tmp/wf_result_line
+      # 放项目目录不放 /tmp：job 用户切换后（gitlab-runner -> root），/tmp 里的
+      # 旧文件属主不对会让重定向直接 Permission denied；.ci-artifacts 每次 job
+      # 前被 runner 清掉，属主必然是当前用户。
+      mkdir -p .ci-artifacts
+      echo "$RESULT" > .ci-artifacts/wf_result_line
     - |
       if [ -n "${NOTIFY_WEBHOOK:-}" ]; then
-        RESULT_LINE="$(cat /tmp/wf_result_line)"
+        RESULT_LINE="$(cat .ci-artifacts/wf_result_line)"
         curl -sS --max-time 10 -H 'Content-Type: application/json' \
           -d "{\"msgtype\":\"text\",\"text\":{\"content\":\"terraform-demo $CI_COMMIT_SHORT_SHA：$RESULT_LINE\"}}" \
           "$NOTIFY_WEBHOOK" || echo "webhook 通知失败（不影响流水线结论）"
