@@ -992,7 +992,70 @@ resource address ... does not exist → 资源名写错），并给两条自查�
 不然每次报错都在逼你做选择题，而选择题的两个答案往往都是错的。
 而且 import 失败时**永远不要吞掉 stderr** —— 那条错误信息是唯一能区分"权限不够 / region 不对 / 不是你的"的东西。**
 
-## 这 56 条怎么分布
+## 第十九轮：镜像仓库 —— 「可达」不等于「拉得到」
+
+### 第 57 条：`/v2/` 返回 401 不是坏消息，`000` 之下还藏着一个假象
+
+**现象**：`gray:configure` 阶段，机器已经配好、80 有响应，但容器起不来：
+
+```
+Error response from daemon: failed to resolve reference "docker.io/library/nginx:alpine":
+  failed to do request: Head "https://registry-1.docker.io/v2/library/nginx/manifests/alpine":
+  dial tcp 104.244.46.186:443: i/o timeout
+```
+
+而 role 自己探测镜像站的结果长这样：
+
+```
+docker.m.daocloud.io → 401
+docker.1ms.run       → 401
+registry-1.docker.io → 000
+```
+
+**两个误读**：
+
+1. **把 401 当成"这个站不能用"**。401 是 registry 协议的正常应答 ——
+   `/v2/` 本来就会回 `WWW-Authenticate: Bearer realm=...`，客户端拿 token 再请求。
+   拉**公开镜像**全程都是匿名的，但匿名不等于不需要 token。
+   所以「401」的真实含义是"这是个能说话的 registry"，而不是"我没权限"。
+
+2. **把 `docker info` 里的 Registry Mirrors 当成"已经生效"**。
+   `daemon.json` 只在 dockerd **启动时**读一次。而 `docker_engine` 里那句
+   `systemctl restart docker` 是 `failed_when: false`（不能让重启失败把整幕带走），
+   于是存在夹缝：文件里写了镜像站、`docker info` 复核也看到了，
+   pull 却仍旧走老路 —— 因为守护进程根本没换过配置。
+
+**怎么验才算验过**：不要停在 `/v2/` 的状态码上，走完完整的认证链路再下结论：
+
+```
+GET  /v2/                                    -> 401 + WWW-Authenticate: Bearer realm=...
+GET  <realm>?service=..&scope=repository:library/nginx:pull  -> 200 + token
+GET  /v2/library/nginx/manifests/alpine      + Authorization: Bearer <token>
+                                             -> 200 = 真的能拉到
+```
+
+2026-10-27 实测（从外部跑这段）：两个第三方站 `manifest=200`、16 个架构；
+阿里云公共仓库 `registry.cn-hangzhou.aliyuncs.com` 对 `library/nginx` 回 401 ——
+**同一个状态码，一个是"能拉"，一个是"没有"。只看状态码分不出来。**
+
+**修法（两层，互不依赖）**：
+
+1. 在 `group_vars/cloud.yml` 里**声明**镜像站（`wf_docker_registry_mirrors`），
+   `docker_engine` 写 `daemon.json` 并重启 docker，再回读 `docker info` 复核；
+2. `app_stack` 在直连失败后再走一条兜底：把仓库名换成镜像站前缀去拉
+   （`nginx:alpine` → `docker.m.daocloud.io/library/nginx:alpine`），
+   拉下来 `docker tag` 回原名，compose 文件一个字不改。
+   这条**不依赖守护进程配置**，正好补上第 2 点那个夹缝。
+
+兜底只在**已声明**的镜像站之间试 —— 用谁的机器拉镜像是使用者写在配置里的决定，
+不该由 role 自动发现。第一段带 `.` 或 `:` 的镜像（别的 registry）直接跳过，
+改写过去只会 404。
+
+**规律：可达性探测能给的结论非常弱 —— 一个 200/401 只说明"TCP 通了、有 HTTP 服务在说话"，
+不说明"我要的东西在它这儿"。要下结论就验到真实产物（manifest / blobs），
+否则那份"探测结果"会把人带到错误的岔路上，比没有更糟。**
+
+## 这 57 条怎么分布
 
 | 轮次 | 主题 | 条目 | 条数 |
 |---|---|---|---|
@@ -1014,6 +1077,7 @@ resource address ... does not exist → 资源名写错），并给两条自查�
 | 第十六轮 | 流水线驱动发布/回滚 | 52–53 | 2 |
 | 第十七轮 | 147 真跑 bootstrap：runner 注册与 provider 版本 | 54–55 | 2 |
 | 第十八轮 | 全局命名的资源：桶名被占 | 56 | 1 |
+| 第十九轮 | 镜像仓库：可达 ≠ 拉得到 | 57 | 1 |
 
 轮次不是按时间堆的，是按**模块**分的 —— 每一轮解决一个模块的问题，
 所以第 7 轮（Ansible）条目最多：那一层的失败模式最不容易在本地复现。

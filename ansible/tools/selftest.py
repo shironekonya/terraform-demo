@@ -761,6 +761,21 @@ def test_image_preflight() -> None:
     check("拉取失败不在这里 raise（要留给 80 配完再统一收场）",
           pull.get("failed_when") is False, pull.get("failed_when"))
 
+    # daemon.json 是启动时读的，而重启失败在这个 role 里不 raise —— 于是存在
+    # 「文件里写了镜像站、docker info 也复核过、pull 仍超时」的夹缝。
+    # 兜底必须不依赖守护进程配置，且只试**已声明**的地址（信任决定归使用者）。
+    mirror_pull = find("依次试已声明的镜像站")
+    mirror_cmd = str(args_of(mirror_pull).get("cmd", ""))
+    check("daemon.json 没生效时，按已声明的镜像站逐个试（不依赖守护进程配置）",
+          "wf_docker_registry_mirrors" in mirror_cmd and "docker pull" in mirror_cmd, mirror_cmd[:80])
+    check("镜像站兜底拉到的镜像回打原名（compose 文件不用改）",
+          "docker tag" in mirror_cmd and "wf_stack_image" in mirror_cmd, mirror_cmd[-80:])
+    check("镜像站兜底失败也不 raise", bool(mirror_pull) and mirror_pull.get("failed_when") is False,
+          mirror_pull.get("failed_when"))
+    probe_mirror = find("依次试已声明的镜像站").get("when") or []
+    check("镜像站兜底以「直连失败」为前提（拉到了就不该再试）",
+          any("wf_stack_pull" in str(w) for w in probe_mirror), probe_mirror)
+
     up = find("拉起容器栈")
     check("up -d 以「镜像已就位」为门槛", "wf_stack_image_ready" in when_text(up), when_text(up))
     check("原本的幂等条件还在（文件变了 / 没在跑才动手）",
