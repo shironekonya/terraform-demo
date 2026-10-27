@@ -8,6 +8,11 @@
 #
 #   terraform -chdir=state-bootstrap apply
 #
+# ★ 桶名为什么带 -tfstate 后缀：OSS 命名空间全站共享，裸名 cloud-native-demo
+#   实测在 cn-hangzhou 已被别的账号占用（403，terraform import 也拿不下来）。
+#   换名要四处同步：本文件、vmware-workstation/backend.tf、
+#   state-bootstrap/variables.tf、RUNNER_147.local.sh 的 BUCKET。
+#
 # 状态锁：**不配 OTS**。并发保护由执行器保证 —— runner 的 concurrent = 1，
 #   同一时刻只有一个 job 在 apply。加第二个 runner 之前必须补锁
 #   （tablestore_endpoint + tablestore_table，见 backend.tf.example）。
@@ -15,7 +20,7 @@
 
 terraform {
   backend "oss" {
-    bucket = "cloud-native-demo"
+    bucket = "cloud-native-demo-tfstate"
     prefix = "terraform-demo/aliyun-ecs"
     key    = "terraform.tfstate"
     region = "cn-hangzhou"

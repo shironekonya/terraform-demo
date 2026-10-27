@@ -968,8 +968,23 @@ fi
 terraform apply -auto-approve -input=false   # 再把版本化/加密对齐
 ```
 
+**实测（2026-10-27，147 上）**：`cloud-native-demo` 在 cn-hangzhou 返回 403，
+`terraform import` 也拿不下来 —— 这个桶**不属于本账号**，就是别人先占了。
+之前的实现把 import 的 stderr 丢进了 `/dev/null`，于是只看到一行"import 失败"，
+既不知道是权限、region 还是归属，也不知道下一步该干什么：
+
+```
+桶已存在（HTTP 403：私有但存在），import 接管而不是重建
+✗ import 失败 —— 这个桶不属于本账号 ...
+```
+
+**所以 import 分支必须二件事一起做**：① 把 terraform 的原话打出来（`2>&1` 存变量再 `sed 's/^/    /'`）；
+② 失败时的指引要能直接照做 —— 四处同步改名字 + 用 curl 验新名字是 404。
+最终改用 `cloud-native-demo-tfstate`（实测 cn-hangzhou / cn-shanghai 都是 404 才定下来）。
+
 **规律：全局命名空间的资源，"创建失败"这条路径上必须有一个 import 分支。
-不然每次报错都在逼你做选择题，而选择题的两个答案往往都是错的。**
+不然每次报错都在逼你做选择题，而选择题的两个答案往往都是错的。
+而且 import 失败时**永远不要吞掉 stderr** —— 那条错误信息是唯一能区分"权限不够 / region 不对 / 不是你的"的东西。**
 
 ## 这 56 条怎么分布
 
