@@ -201,6 +201,8 @@ gray:configure:
       artifacts: true
   script:
     - cd "$ANSIBLE_ROOT"
+    # 生成清单的同时会清掉这批 IP 的旧主机键：蓝绿每次都是 destroy 一台建一台，
+    # 公网 IP 必然被复用，known_hosts 里上一台机器的键会让第一幕直接 UNREACHABLE
     - python3 tools/gen_cloud_inventory.py --from-output-json "$ARTIFACT_DIR/tf-outputs.json" --user "${WF_SSH_USER:-root}" --ssh-key "${WF_SSH_KEY_FILE:-$HOME/.ssh/id_ed25519}"
     # 版本名 = commit。写进页面、releases/<版本>/、current 指针 —— 健康检查就靠它对版本
     - ansible-playbook playbooks/site.yml --limit cloud -e "wf_release=$CI_COMMIT_SHORT_SHA"

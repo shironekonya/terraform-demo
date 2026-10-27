@@ -679,7 +679,7 @@ terraform providers lock -platform=windows_amd64 -platform=linux_amd64
 | 遗留物 | 不清的后果 | 怎么清 |
 |---|---|---|
 | `ansible/inventory/hosts.cloud.yml` | 清单里是指向已释放 IP 的主机，下次 `ansible-playbook` 卡在连接超时 | 删文件，下次 `apply` 后重新生成 |
-| `~/.ssh/known_hosts` 里该 IP 的记录 | 公网 IP 会被回收再分配，重建的机器大概率拿到同一个 IP，于是 ssh 报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，Ansible 在第一幕 `Gathering Facts` 就判 `UNREACHABLE`（踩坑 45） | `ssh-keygen -f ~/.ssh/known_hosts -R <该 IP>` |
+| `~/.ssh/known_hosts` 里该 IP 的记录 | 公网 IP 会被回收再分配，重建的机器大概率拿到同一个 IP，于是 ssh 报 `REMOTE HOST IDENTIFICATION HAS CHANGED`，Ansible 在第一幕 `Gathering Facts` 就判 `UNREACHABLE`（踩坑 45） | **已自动化**：`tools/gen_cloud_inventory.py` 生成清单时同步删掉这批 IP 的旧键（含 `HashKnownHosts` 的 `\|1\|salt\|hmac` 写法）—— 手工排查时仍可用 `ssh-keygen -f ~/.ssh/known_hosts -R <该 IP>` |
 | `aliyun-ecs/tf-outputs.json`（若生成过） | 一份过期载荷，`--from-output-json` 会读到旧 IP | 删文件 |
 
 第二样最容易被忽略，因为 `destroy` 的视角里它根本不存在。但它是**唯一一个会跨 destroy 存活、并且在下一次 `apply` 之后才发作**的遗留物。
