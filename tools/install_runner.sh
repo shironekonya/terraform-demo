@@ -149,6 +149,33 @@ say "服务状态"
 systemctl is-active gitlab-runner
 gitlab-runner verify 2>&1 | tail -5
 
+# ---------------------------------------------------------------------------
+# 5. 自证：服务的运行用户必须读得到 /root 下的收敛文件
+#
+# runner 若以 gitlab-runner 用户跑（系统包默认），而 /root 是 700，
+# gray:apply 会在"找不到 /root/.wf-aliyun.tfvars"上失败 —— 那个报错
+# 离真因（服务的 User= 不对）十万八千里，所以在这里当场验一次。
+# verify valid 只代表 token 有效，不代表文件可见。
+# ---------------------------------------------------------------------------
+if [ -f /root/.wf-aliyun.tfvars ] || [ -f /root/.wf-aliyun.env ]; then
+  SVC_USER="$(systemctl show -p User --value gitlab-runner 2>/dev/null || echo gitlab-runner)"
+  if [ "${SVC_USER}" != "root" ]; then
+    cat <<WARN
+
+  ⚠ gitlab-runner 服务以 ${SVC_USER} 运行，读不到 /root（700）下的收敛文件 ——
+    gray:apply 会失败在"找不到 /root/.wf-aliyun.tfvars"，看似 tfvars 没收敛，
+    实际是服务用户不对。切 root（一次性）：
+
+      sudo mkdir -p /etc/systemd/system/gitlab-runner.service.d
+      printf '[Service]\nUser=root\n' | sudo tee /etc/systemd/system/gitlab-runner.service.d/override.conf
+      sudo systemctl daemon-reload && sudo systemctl restart gitlab-runner
+
+WARN
+  else
+    say "服务以 root 运行，/root 下的收敛文件可见"
+  fi
+fi
+
 cat <<EOF
 
 ✓ 完成。接下来在 GitLab 侧确认三件事：
