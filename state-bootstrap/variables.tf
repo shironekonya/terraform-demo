@@ -7,8 +7,8 @@ variable "region" {
 variable "bucket" {
   description = "state 桶名。全局唯一，被占用时换名（四处要一起改：本文件 + 两份 backend.tf + RUNNER_147.local.sh）"
   type        = string
-  # ★ 为什么带 -tfstate 后缀：裸名 cloud-native-demo 实测在 cn-hangzhou 已被
-  #   别的账号占用（403 AccessDenied、import 也拿不下来）。OSS 命名空间全站共享，
-  #   短而通用的名字被抢是常态 —— 与其猜，不如一开始就用带用途后缀的名字。
-  default     = "cloud-native-demo-tfstate"
+  # ★ 名字由使用者指定（cloud-native-demo），不自动加后缀。
+  #   若 import 报 AccessDenied / no right，是 AK 的 RAM 用户权限不够；
+  #   只有报 does not belong to you 才是桶在别的账号里 —— 那才需要换名。
+  default     = "cloud-native-demo"
 }

@@ -8,8 +8,12 @@
 #
 #   terraform -chdir=state-bootstrap apply
 #
-# ★ 桶名为什么带 -tfstate 后缀：OSS 命名空间全站共享，裸名 cloud-native-demo
-#   实测在 cn-hangzhou 已被别的账号占用（403，terraform import 也拿不下来）。
+# ★ 桶名 cloud-native-demo（使用者指定的名字，不改）。
+#   OSS 命名空间跨账号全局共享，匿名探测只能看到「桶在不在」（403/404），
+#   看不到 owner —— 所以「403 且 import 失败」有两种完全不同的原因：
+#     · AK 所在账号/RAM 用户对该桶没权限  -> 补权限，名字不用动
+#     · 桶真的属于别的账号                 -> 才需要换名（四处同步）
+#   脚本第 3 步会把 terraform import 的原话打出来，按原话判读，别猜。
 #   换名要四处同步：本文件、vmware-workstation/backend.tf、
 #   state-bootstrap/variables.tf、RUNNER_147.local.sh 的 BUCKET。
 #
@@ -20,7 +24,7 @@
 
 terraform {
   backend "oss" {
-    bucket = "cloud-native-demo-tfstate"
+    bucket = "cloud-native-demo"
     prefix = "terraform-demo/aliyun-ecs"
     key    = "terraform.tfstate"
     region = "cn-hangzhou"

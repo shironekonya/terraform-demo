@@ -9,7 +9,7 @@
 
 terraform {
   backend "oss" {
-    bucket = "cloud-native-demo-tfstate"
+    bucket = "cloud-native-demo"
     prefix = "terraform-demo/vmware-workstation"
     key    = "terraform.tfstate"
     region = "cn-hangzhou"

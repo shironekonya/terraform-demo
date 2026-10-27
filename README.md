@@ -51,7 +51,7 @@ sudo GITLAB_URL=http://192.168.193.139:8000 \
   也可以改用 GitLab CI Variables（两种并存时这份文件优先）。
 - **terraform 入参收敛**：`terraform.tfvars`（SSH 公钥、放行网段）和 `terraform.rc`（provider 镜像）
   都被 gitignore，CI 每次都是全新 clone —— 收敛成 `/root/.wf-aliyun.tfvars` 与 `/root/.wf-terraform.rc`。
-- **远程 state 的底层资源**：`state-bootstrap/` 模块创建 OSS 状态桶 `cloud-native-demo-tfstate`
+- **远程 state 的底层资源**：`state-bootstrap/` 模块创建 OSS 状态桶 `cloud-native-demo`
   （backend 不能用资源创建自己，鸡生蛋，所以自举），它在 `boundaries.yml` 登记豁免。
   **状态锁不配 OTS**：并发保护由 runner 的 `concurrent = 1` 保证 —— 加第二个 runner 前必须补锁
   （模板见 `backend.tf.example`）。

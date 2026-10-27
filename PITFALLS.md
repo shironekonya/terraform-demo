@@ -969,9 +969,12 @@ terraform apply -auto-approve -input=false   # 再把版本化/加密对齐
 ```
 
 **实测（2026-10-27，147 上）**：`cloud-native-demo` 在 cn-hangzhou 返回 403，
-`terraform import` 也拿不下来 —— 这个桶**不属于本账号**，就是别人先占了。
-之前的实现把 import 的 stderr 丢进了 `/dev/null`，于是只看到一行"import 失败"，
-既不知道是权限、region 还是归属，也不知道下一步该干什么：
+`terraform import` 也失败。当时的实现把 import 的 stderr 丢进了 `/dev/null`，
+于是只看到一行"import 失败"，既不知道是权限、region 还是归属 ——
+就顺手下了"这个桶不属于本账号"的结论并改名。**这个结论下早了**：
+403 是匿名请求的语义（私有桶一律 403），只能说明"桶存在"，**看不出 owner**；
+而 import 失败同样可能是 RAM 子用户对该桶没权限。两者现象一样，处理方式相反。
+桶名后来改回 `cloud-native-demo`（使用者指定），脚本只保留一条原则：**按原话判读，不猜**。
 
 ```
 桶已存在（HTTP 403：私有但存在），import 接管而不是重建
@@ -980,7 +983,10 @@ terraform apply -auto-approve -input=false   # 再把版本化/加密对齐
 
 **所以 import 分支必须二件事一起做**：① 把 terraform 的原话打出来（`2>&1` 存变量再 `sed 's/^/    /'`）；
 ② 失败时的指引要能直接照做 —— 四处同步改名字 + 用 curl 验新名字是 404。
-最终改用 `cloud-native-demo-tfstate`（实测 cn-hangzhou / cn-shanghai 都是 404 才定下来）。
+失败指引按报错分四支（AccessDenied/Forbidden.RAM → 补子用户权限；does not belong to you /
+BucketAlreadyExists → 才换名；NoSuchBucket / must be addressed using... → region 不对；
+resource address ... does not exist → 资源名写错），并给两条自查：
+`aliyun sts GetCallerIdentity` 看这对 AK 是谁、`aliyun oss ls oss://<bucket>/` 看碰不碰得到。
 
 **规律：全局命名空间的资源，"创建失败"这条路径上必须有一个 import 分支。
 不然每次报错都在逼你做选择题，而选择题的两个答案往往都是错的。

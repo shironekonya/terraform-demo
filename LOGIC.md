@@ -258,7 +258,7 @@ python3 tools/check_boundaries.py --require-ci             # CI 用：没有流�
 如果连提示文本都算越界，这个检查器第一天就会被无视，然后被删掉。
 
 当前状态：**B1~B9 全部通过**。远程后端已启用：`aliyun-ecs` / `vmware-workstation` 各配了
-`backend.tf`（同一个 OSS 桶 `cloud-native-demo-tfstate`，不同 prefix），桶由 `state-bootstrap/`
+`backend.tf`（同一个 OSS 桶 `cloud-native-demo`，不同 prefix），桶由 `state-bootstrap/`
 用本地 state 自举一次 —— backend 不能用资源创建自己，这是唯一合理的一次性动作
 （登记在豁免清单里）。**状态锁不配 OTS**：并发保护由 runner 的 `concurrent = 1` 保证
 （同一时刻只有一个 job 在 apply），B4 对此只给提示 —— 加第二个 runner 之前必须补锁。
@@ -413,7 +413,7 @@ exemptions:
 
 ```bash
 # 1) 先建底层资源（Terraform 不会替你建）
-#    · 一个专用 OSS Bucket（本项目由 state-bootstrap/ 建，桶名 cloud-native-demo-tfstate）
+#    · 一个专用 OSS Bucket（本项目由 state-bootstrap/ 建，桶名 cloud-native-demo）
 #    · 状态锁（可选）：一个 OTS(TableStore) 实例 + 一张锁表
 #      ★ 锁表必须有一列叫 LockID、类型 String —— 漏了会报锁失败
 #      本项目当前不配锁：单执行器 concurrent = 1，加第二个 runner 前再补
