@@ -215,7 +215,9 @@
                      exit 3 ;;
           esac
           if [ -z "${head}" ]; then path="library/${repo}"; else path="${repo}"; fi
-          for m in {{ wf_docker_registry_mirrors | map('regex_replace', '^https?://', '') | map('regex_replace', '/+$', '') | join(' ') }}; do
+          for m in {{ wf_docker_registry_mirrors | join(' ') }}; do
+            m="${m#http://}"; m="${m#https://}"; m="${m%/}"   # 只留 host，docker 自己补协议
+            [ -z "${m}" ] && continue
             echo "── 试 ${m}/${path}"
             if timeout {{ wf_stack_pull_timeout }} docker pull "${m}/${path}"; then
               docker tag "${m}/${path}" "${img}"
