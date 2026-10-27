@@ -158,7 +158,7 @@ cat <<EOF
        ALICLOUD_ACCESS_KEY / ALICLOUD_SECRET_KEY   （Masked）
        WF_SSH_KEY_FILE                             （File 类型，ECS 私钥）
   3. 147 上这份仓库的工作区必须是干净的 ——
-     runner 直接在 $CI_PROJECT_DIR 里跑，脏工作区会让 plan 的差异说不清。
+     runner 直接在 ${CI_PROJECT_DIR:-/data/terraform-demo-ci} 里跑，脏工作区会让 plan 的差异说不清。
 
   自测：随便改一行 README 推到默认分支，看 validate 两个 job 是否变绿。
 EOF
