@@ -158,21 +158,29 @@ gitlab-runner verify 2>&1 | tail -5
 # verify valid 只代表 token 有效，不代表文件可见。
 # ---------------------------------------------------------------------------
 if [ -f /root/.wf-aliyun.tfvars ] || [ -f /root/.wf-aliyun.env ]; then
-  SVC_USER="$(systemctl show -p User --value gitlab-runner 2>/dev/null || echo gitlab-runner)"
+  # 别用 systemctl show -p User 判断：ExecStart 里的 --user 参数优先级更高，
+  # 会骗过 systemd 层的 User=（147 实测）。看进程实际属主才准。
+  SVC_USER="$(ps -o user= -C gitlab-runner 2>/dev/null | head -1 || echo unknown)"
   if [ "${SVC_USER}" != "root" ]; then
     cat <<WARN
 
-  ⚠ gitlab-runner 服务以 ${SVC_USER} 运行，读不到 /root（700）下的收敛文件 ——
+  ⚠ gitlab-runner 进程以 ${SVC_USER} 运行，读不到 /root（700）下的收敛文件 ——
     gray:apply 会失败在"找不到 /root/.wf-aliyun.tfvars"，看似 tfvars 没收敛，
-    实际是服务用户不对。切 root（一次性）：
+    实际是服务用户不对。注意 ExecStart 里若带 --user 参数，它优先于 User=，
+    只 override User= 没用，必须连 ExecStart 一起覆盖（一次性）：
 
-      sudo mkdir -p /etc/systemd/system/gitlab-runner.service.d
-      printf '[Service]\nUser=root\n' | sudo tee /etc/systemd/system/gitlab-runner.service.d/override.conf
+      sudo tee /etc/systemd/system/gitlab-runner.service.d/override.conf >/dev/null <<'UNIT'
+      [Service]
+      User=root
+      ExecStart=
+      ExecStart=/usr/bin/gitlab-runner "run" "--config" "/etc/gitlab-runner/config.toml" "--working-directory" "/home/gitlab-runner" "--service" "gitlab-runner" "--user" "root"
+      UNIT
       sudo systemctl daemon-reload && sudo systemctl restart gitlab-runner
+      ps -o user= -C gitlab-runner   # 显示 root 才算成
 
 WARN
   else
-    say "服务以 root 运行，/root 下的收敛文件可见"
+    say "gitlab-runner 进程以 root 运行，/root 下的收敛文件可见"
   fi
 fi
 
